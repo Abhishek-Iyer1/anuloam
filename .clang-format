@@ -1,0 +1,7 @@
+---
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 100
+ConstructorInitializerIndentWidth: 2
+AccessModifierOffset: -1
+PackConstructorInitializers: NextLine
