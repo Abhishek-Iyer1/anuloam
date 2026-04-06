@@ -1,6 +1,7 @@
 build/
 install/
 log/
+.vscode/
 
 # rosbag data — too large for version control
 data/
