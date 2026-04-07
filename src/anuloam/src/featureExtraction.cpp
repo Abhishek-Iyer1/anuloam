@@ -48,8 +48,9 @@ public:
      * @param edgeThresh the roughness threshold above which a point is considered an edge
      * @param planarThresh the roughness threshold below which a point is considered a patch
      * @param totalFeatures the number of total features to extract from a 2D scan
+     * @todo: Multithreading
      */
-    void extract2DFeatures(const pcl::PointCloud<PointXYZIR>& ring, int neighbours, float edgeThresh, float planarThresh, int totalFeatures) {
+    void extract2DFeatures(const pcl::PointCloud<PointXYZIR>& ring) {
         
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
@@ -72,7 +73,7 @@ public:
             }
             float norm = (ring[ind].x*ring[ind].x + ring[ind].y*ring[ind].y + ring[ind].z*ring[ind].z);
             float roughness = (sumX * sumX + sumY * sumY + sumZ * sumZ) / (neighbours * neighbours * norm);
-            
+
             // std::printf("Norm is: %f\tRoughness is: %f\n", norm, roughness);
 
             // if above a threshold (i.e. edge), then add to edge container
@@ -93,6 +94,17 @@ public:
         // TODO: Rejecting edge cases mentioned in the LOAM Paper (https://frc.ri.cmu.edu/~zhangji/publications/RSS_2014.pdf)
     }
 
+    /**
+     * @brief extract edge and patch features from the 3D scan by stacking 2D features (extract2DFeatures)
+     * @todo: Multithreading
+     */
+    void extract3DFeatures() {
+        this->extractRings(_pcl);
+        for (auto& ring : this->_rings) {
+            this->extract2DFeatures(ring);
+        }
+    }
+
     // TODO: How to protect against getRings() called when rings is empty?
     // TODO: Don't need to store R in the point if I already have them in rings
     std::vector<pcl::PointCloud<PointXYZIR>> getRings() { return _rings; }
@@ -105,6 +117,10 @@ private:
     pcl::PointCloud<PointXYZIR> _edges;
     pcl::PointCloud<PointXYZIR> _patches;
     pcl::PointCloud<PointXYZIR> _features;
+    int neighbours = 10; 
+    float edgeThresh = 0.25; 
+    float planarThresh = 1e-4; 
+    int totalFeatures = 25;
 };
 
 class FeatureExtraction : public rclcpp::Node {
@@ -130,11 +146,11 @@ private:
     std::vector<pcl::PointCloud<PointXYZIR>> rings = LF.getRings();
 
     // Convert PCL -> ROS message and publish
-    pcl::Indices indices(200);
-    std::iota(indices.begin(), indices.end(), 0);
+    // pcl::Indices indices(200);
+    // std::iota(indices.begin(), indices.end(), 0);
 
-    LF.extract2DFeatures(rings[0], 10, 0.25, 1e-4, 25);
-
+    
+    LF.extract3DFeatures();
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
 
     // for (size_t i = 0; i < subRing->points.size(); i++) {
