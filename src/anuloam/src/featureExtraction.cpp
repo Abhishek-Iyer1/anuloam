@@ -54,42 +54,52 @@ public:
         
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
-        size_t currentFeatures = 0;
+        int numSections = 8;
 
-        for (size_t ind=0; ind<scanSize; ind++) {
-            // calculate roughness of point
-            int setStart = -(neighbours / 2);
-            int setEnd =  (neighbours / 2);
+        int setStart = -(neighbours / 2);
+        int setEnd =  (neighbours / 2);
 
-            float sumX = 0, sumY = 0, sumZ = 0;
+        for (size_t section=1; section <= numSections; section++) {
+            
+            size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
+            size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
+            size_t currentFeatures = 0;
+            size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
 
-            for (int j = setStart; j <= setEnd; j++) {
-                if (j == 0) continue;
-                size_t wrapped = (ind + j + scanSize) % scanSize;
-                sumX += ring[ind].x - ring[wrapped].x;
-                sumY += ring[ind].y - ring[wrapped].y;
-                sumZ += ring[ind].z - ring[wrapped].z;
-                // std::printf("Differences are: %f, %f, %f\n", sumX, sumY, sumZ);
-            }
-            float norm = (ring[ind].x*ring[ind].x + ring[ind].y*ring[ind].y + ring[ind].z*ring[ind].z);
-            float roughness = (sumX * sumX + sumY * sumY + sumZ * sumZ) / (neighbours * neighbours * norm);
+            // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
 
-            // std::printf("Norm is: %f\tRoughness is: %f\n", norm, roughness);
+            for (size_t ind = startInd; ind < endInd; ind++) {
+                // calculate roughness of point
+                float sumX = 0, sumY = 0, sumZ = 0;
 
-            // if above a threshold (i.e. edge), then add to edge container
-            if ( roughness > edgeThresh) {
-                _edges.push_back(ring[ind]);
-                currentFeatures++;
-            }
+                for (int j = setStart; j <= setEnd; j++) {
+                    if (j == 0) continue;
+                    size_t wrapped = (ind + j + scanSize) % scanSize;
+                    sumX += ring[ind].x - ring[wrapped].x;
+                    sumY += ring[ind].y - ring[wrapped].y;
+                    sumZ += ring[ind].z - ring[wrapped].z;
+                    // std::printf("Differences are: %f, %f, %f\n", sumX, sumY, sumZ);
+                }
 
-            // if below a certain threshold (i.e. patch), then add to the patch container
-            else if ((roughness < planarThresh) && (currentFeatures < totalFeatures)) {
-                _patches.push_back(ring[ind]);
-                currentFeatures++;
+                // Note: Mathematically speaking we are calculating roughness^2 to save computations on square root operations
+                float norm = (ring[ind].x*ring[ind].x + ring[ind].y*ring[ind].y + ring[ind].z*ring[ind].z);
+                float roughness = (sumX * sumX + sumY * sumY + sumZ * sumZ) / (neighbours * neighbours * norm);
+
+                // std::printf("Norm is: %f\tRoughness is: %f\n", norm, roughness);
+
+                // if above a threshold (i.e. edge), then add to edge container
+                if (( roughness > edgeThresh) && (currentFeatures < sectionFeatures)) {
+                    _edges.push_back(ring[ind]);
+                    currentFeatures++;
+                }
+
+                // if below a certain threshold (i.e. patch), then add to the patch container
+                else if ((roughness < planarThresh) && (currentFeatures < sectionFeatures)) {
+                    _patches.push_back(ring[ind]);
+                    currentFeatures++;
+                }
             }
         }
-
-        // TODO: Non Maximal Suppression equivalent -> get an even spread of features
 
         // TODO: Rejecting edge cases mentioned in the LOAM Paper (https://frc.ri.cmu.edu/~zhangji/publications/RSS_2014.pdf)
     }
@@ -109,6 +119,8 @@ public:
     // TODO: Don't need to store R in the point if I already have them in rings
     std::vector<pcl::PointCloud<PointXYZIR>> getRings() { return _rings; }
     pcl::PointCloud<PointXYZIR> getPCL() {return _pcl;}
+    pcl::PointCloud<PointXYZIR> getEdges() {return _edges;}
+    pcl::PointCloud<PointXYZIR> getPatches() {return _patches;}
     pcl::PointCloud<PointXYZIR> getFeatures() {return _edges + _patches;}
 
 private:
@@ -117,10 +129,10 @@ private:
     pcl::PointCloud<PointXYZIR> _edges;
     pcl::PointCloud<PointXYZIR> _patches;
     pcl::PointCloud<PointXYZIR> _features;
-    int neighbours = 10; 
+    int neighbours = 16; 
     float edgeThresh = 0.25; 
-    float planarThresh = 1e-4; 
-    int totalFeatures = 25;
+    float planarThresh = 1e-4; //1e-4; 
+    int totalFeatures = 32;
 };
 
 class FeatureExtraction : public rclcpp::Node {
