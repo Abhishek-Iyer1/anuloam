@@ -19,10 +19,14 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(OpenMP REQUIRED)
 
 add_executable(feature_extraction src/featureExtraction.cpp)
 ament_target_dependencies(feature_extraction rclcpp sensor_msgs pcl_ros pcl_conversions)
-target_link_libraries(feature_extraction ${PCL_LIBRARIES})
+target_link_libraries(feature_extraction 
+    ${PCL_LIBRARIES} 
+    OpenMP::OpenMP_CXX
+)
 
 install(
   TARGETS feature_extraction

@@ -3,7 +3,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <span>
+
+#define NUM_RINGS 16
 
 struct PointXYZIR {
     PCL_ADD_POINT4D;
@@ -26,6 +27,9 @@ struct PointRoughness {
 };
 
 
+/**
+ *  @todo: Need to support each point in the scan having a timestamp parameter
+ */
 class LidarFrame {
 public:
     LidarFrame(const pcl::PointCloud<PointXYZIR>& cloud) : _pcl (cloud) {};
@@ -38,11 +42,11 @@ public:
     void extractRings(const pcl::PointCloud<PointXYZIR>& cloud) {
 
         // extract indices for each point and form populate ```rings```
-        std::vector<std::vector<int>> ringIndices(16, std::vector<int>());
+        std::vector<std::vector<int>> ringIndices(NUM_RINGS, std::vector<int>());
         for (size_t j=0; j<cloud.points.size(); j++) {
             ringIndices[cloud.points[j].ring].push_back(j);
         }
-        for (size_t ring=0; ring<16; ring++) {
+        for (size_t ring=0; ring<NUM_RINGS; ring++) {
             _rings.emplace_back(cloud, pcl::Indices(ringIndices[ring]));
         }
     };
@@ -80,20 +84,25 @@ public:
      * @param totalFeatures the number of total features to extract from a 2D scan
      * @todo: Multithreading
      */
-    void extract2DFeatures(const pcl::PointCloud<PointXYZIR>& ring) {
+    void extract2DFeatures(
+        const pcl::PointCloud<PointXYZIR>& ring, 
+        pcl::PointCloud<PointXYZIR>& edgeFeatures, 
+        pcl::PointCloud<PointXYZIR>& planarFeatures
+    ) {
         
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
         int numSections = 8;
+        int edgeFeaturesPerSection = 2;
+        int planarFeaturesPerSection = 4;
 
+        // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
             
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
             size_t currentFeatures = 0;
             size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
-            int edgeFeaturesPerSection = 2;
-            int planarFeaturesPerSection = 4;
 
             // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
 
@@ -118,7 +127,7 @@ public:
 
             for (size_t i = 0; i < edgeFeaturesPerSection && i < roughnesses.size(); i++) {
                 if (roughnesses[i].roughness > edgeThresh) {
-                    _edges.push_back(ring[roughnesses[i].index]);
+                    edgeFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
             
@@ -134,7 +143,7 @@ public:
 
             for (size_t i = 0; i < planarFeaturesPerSection && i < roughnesses.size(); i++) {
                 if (roughnesses[i].roughness < planarThresh) {
-                    _patches.push_back(ring[roughnesses[i].index]);
+                    planarFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
 
@@ -160,8 +169,20 @@ public:
      */
     void extract3DFeatures() {
         this->extractRings(_pcl);
-        for (auto& ring : this->_rings) {
-            this->extract2DFeatures(ring);
+
+        // create buckets per ring to containerize the memory accessed by each thread
+        std::vector<pcl::PointCloud<PointXYZIR>> edgeBuckets(NUM_RINGS);
+        std::vector<pcl::PointCloud<PointXYZIR>> planarBuckets(NUM_RINGS);
+
+        #pragma omp parallel for num_threads(8)
+        for (size_t i=0; i<NUM_RINGS; i++) {
+            this->extract2DFeatures(this->_rings[i], edgeBuckets[i], planarBuckets[i]);
+        }
+
+        // collate returned data back into the edge and patches 
+        for (size_t i=0; i<NUM_RINGS; i++) {
+            this->_edges += edgeBuckets[i];
+            this->_patches += planarBuckets[i];
         }
     }
 
