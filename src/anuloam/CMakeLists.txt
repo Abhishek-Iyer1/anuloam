@@ -14,11 +14,14 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(imu_preintegration src/imu_preintegration.cpp)
-ament_target_dependencies(imu_preintegration rclcpp sensor_msgs)
+ament_target_dependencies(imu_preintegration rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros)
 target_link_libraries(imu_preintegration gtsam)
 
 # Explicitly control RPATH so conda's lib directory is never embedded in the
