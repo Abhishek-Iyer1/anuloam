@@ -1,0 +1,42 @@
+#include <vector>
+#include <cassert>
+
+template <typename T>
+class CircularBuffer {
+public:
+    CircularBuffer(size_t size) : _isFull(false), _head(0), _maxSize(size) {
+        _data.resize(size);
+    }
+
+    void push_back(const T& elem) {
+        _data[_head] = elem;
+        _head++;
+
+        if (_head >= _maxSize) {
+            _head = 0;
+            _isFull = true;
+        }
+    }
+
+    size_t size() const {
+        if (_isFull) {return _maxSize;}
+        else {return _head;}
+    }
+
+    /**
+     * @warn: You are indexing chronologically, such that 0 is the oldest data point
+     */
+    const T& operator[](size_t i) const {
+        assert(i < this->size() && "CircularBuffer: Index out of logical bounds!");
+        if (_isFull) {
+            return _data[(_head + i) % _maxSize];
+        }
+        return _data[i];
+    }
+
+private:
+    std::vector<T> _data;
+    size_t _head;
+    bool _isFull;
+    size_t _maxSize;
+};

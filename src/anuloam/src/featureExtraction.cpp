@@ -2,7 +2,11 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
+#include <pcl/common/transforms.h>
 #include <pcl/point_types.h>
+#include <Eigen/Geometry>
+#include <vector>
+#include "utils.hpp"
 
 #define NUM_RINGS 16
 
@@ -32,6 +36,7 @@ struct PointRoughness {
  */
 class LidarFrame {
 public:
+    LidarFrame() = default;
     LidarFrame(const pcl::PointCloud<PointXYZIR>& cloud) : _pcl (cloud) {};
     LidarFrame(const sensor_msgs::msg::PointCloud2& msg) { pcl::fromROSMsg(msg, _pcl); }
     
@@ -184,15 +189,26 @@ public:
             this->_edges += edgeBuckets[i];
             this->_patches += planarBuckets[i];
         }
+
+        this->_features = this->_edges + this->_patches;
+    }
+
+    /**
+     * @brief transforms the extracted lidar features by a given homogeneous transform
+     */
+    pcl::PointCloud<PointXYZIR> transform(const Eigen::Isometry3f& tf) const {
+        pcl::PointCloud<PointXYZIR> transformed;
+        pcl::transformPointCloud(this->getFeatures(), transformed, tf.matrix());
+        return transformed;
     }
 
     // TODO: How to protect against getRings() called when rings is empty?
     // TODO: Don't need to store R in the point if I already have them in rings
     std::vector<pcl::PointCloud<PointXYZIR>> getRings() { return _rings; }
-    pcl::PointCloud<PointXYZIR> getPCL() {return _pcl;}
-    pcl::PointCloud<PointXYZIR> getEdges() {return _edges;}
-    pcl::PointCloud<PointXYZIR> getPatches() {return _patches;}
-    pcl::PointCloud<PointXYZIR> getFeatures() {return _edges + _patches;}
+    pcl::PointCloud<PointXYZIR> getPCL() const {return _pcl;}
+    pcl::PointCloud<PointXYZIR> getEdges() const {return _edges;}
+    pcl::PointCloud<PointXYZIR> getPatches() const {return _patches;}
+    const pcl::PointCloud<PointXYZIR>& getFeatures() const { return _features; }
 
 private:
     pcl::PointCloud<PointXYZIR> _pcl;
@@ -208,15 +224,44 @@ private:
     float maxRange = 20.0;
 };
 
+class LocalMap {
+public:
+    
+    LocalMap(size_t size) : _keyframes(size) {};
+    
+    CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> getKeyframes() { return _keyframes; }
+    
+    void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { _keyframes.push_back(keyframe);}
+    
+    /**
+     * @todo: 
+     */
+    pcl::PointCloud<PointXYZIR> getPointCloud() {
+        pcl::PointCloud<PointXYZIR> localMapPCL;
+        // TODO: Create a new PointCloud and keep appending transformed pointCloud for all _keyframes.size().
+        for (size_t i = 0; i < _keyframes.size(); ++i) {
+            const auto& [frame, tf] = _keyframes[i];
+            localMapPCL += frame.transform(tf);
+        }
+        return localMapPCL;
+    }
+
+    // Todo: Add a scanMatching method that takes in a LidarFrame and outputs a Eigen::Isometry3f which is the LO factor
+
+private:
+    CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
+};
+
 class FeatureExtraction : public rclcpp::Node {
 public:
-  FeatureExtraction() : Node("feature_extraction") {
+  FeatureExtraction() : Node("feature_extraction"), localMap(50) {
     // TODO: check what QoS profile to follow here
     sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "/points_raw", 10,
         std::bind(&FeatureExtraction::pointCloudCallback, this, std::placeholders::_1));
 
     pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_processed", 10);
+    pubLocalMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_local_map", 10);
     pubTest_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
   }
 
@@ -236,12 +281,19 @@ private:
 
     
     LF.extract3DFeatures();
+    Eigen::Isometry3f tf;
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
+    localMap.pushKeyframe({LF, tf.Identity()});
 
     // for (size_t i = 0; i < subRing->points.size(); i++) {
     //     float azimuth = std::atan2(subRing->points[i].y, subRing->points[i].x) * 180.0 / M_PI;
     //     RCLCPP_INFO(this->get_logger(), "Point %zu: azimuth = %.2f°", i, azimuth);
     // }
+
+    sensor_msgs::msg::PointCloud2 localMapROS;
+    pcl::toROSMsg(localMap.getPointCloud(), localMapROS);
+    localMapROS.header = msg->header;
+    pubLocalMap_->publish(localMapROS);
 
     sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(features, output);
@@ -257,7 +309,9 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
+  LocalMap localMap;
 };
 
 
