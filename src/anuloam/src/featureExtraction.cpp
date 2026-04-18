@@ -39,7 +39,7 @@ public:
     LidarFrame() = default;
     LidarFrame(const pcl::PointCloud<PointXYZIR>& cloud) : _pcl (cloud) {};
     LidarFrame(const sensor_msgs::msg::PointCloud2& msg) { pcl::fromROSMsg(msg, _pcl); }
-    
+
     /**
      * @brief extract 2D scans for every ring in the 3D pointcloud scan
      * @param cloud 3D input scan of with ring information
@@ -57,7 +57,7 @@ public:
     };
 
     float computeRoughness(const pcl::PointCloud<PointXYZIR>& ring, size_t ind) {
-        
+
         float norm = ring[ind].x * ring[ind].x + ring[ind].y * ring[ind].y + ring[ind].z * ring[ind].z;
         if (norm < minRange * minRange || norm > maxRange * maxRange) {
             return -1.0f; // r < 0 filtered out later
@@ -90,11 +90,11 @@ public:
      * @todo: Multithreading
      */
     void extract2DFeatures(
-        const pcl::PointCloud<PointXYZIR>& ring, 
-        pcl::PointCloud<PointXYZIR>& edgeFeatures, 
+        const pcl::PointCloud<PointXYZIR>& ring,
+        pcl::PointCloud<PointXYZIR>& edgeFeatures,
         pcl::PointCloud<PointXYZIR>& planarFeatures
     ) {
-        
+
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
         int numSections = 8;
@@ -103,7 +103,7 @@ public:
 
         // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
-            
+
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
             size_t currentFeatures = 0;
@@ -124,8 +124,8 @@ public:
             size_t kEdge = std::min(static_cast<size_t>(edgeFeaturesPerSection), roughnesses.size());
 
             std::partial_sort(
-                roughnesses.begin(), 
-                roughnesses.begin() + kEdge, 
+                roughnesses.begin(),
+                roughnesses.begin() + kEdge,
                 roughnesses.end(),
                 [](const auto& a, const auto& b) { return a.roughness > b.roughness; }
             );
@@ -135,13 +135,13 @@ public:
                     edgeFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
-            
+
             // append k smoothest points (i.e. patches) to _patches
             size_t kPatch = std::min(static_cast<size_t>(planarFeaturesPerSection), roughnesses.size());
 
             std::partial_sort(
-                roughnesses.begin(), 
-                roughnesses.begin() + kPatch, 
+                roughnesses.begin(),
+                roughnesses.begin() + kPatch,
                 roughnesses.end(),
                 [](const auto& a, const auto& b) { return a.roughness < b.roughness; }
             );
@@ -184,7 +184,7 @@ public:
             this->extract2DFeatures(this->_rings[i], edgeBuckets[i], planarBuckets[i]);
         }
 
-        // collate returned data back into the edge and patches 
+        // collate returned data back into the edge and patches
         for (size_t i=0; i<NUM_RINGS; i++) {
             this->_edges += edgeBuckets[i];
             this->_patches += planarBuckets[i];
@@ -216,9 +216,9 @@ private:
     pcl::PointCloud<PointXYZIR> _edges;
     pcl::PointCloud<PointXYZIR> _patches;
     pcl::PointCloud<PointXYZIR> _features;
-    int neighbours = 16; 
-    float edgeThresh = 0.25; 
-    float planarThresh = 1e-4; //1e-4; 
+    int neighbours = 16;
+    float edgeThresh = 0.25;
+    float planarThresh = 1e-4; //1e-4;
     int totalFeatures = 32;
     float minRange = 1.0;
     float maxRange = 20.0;
@@ -226,15 +226,15 @@ private:
 
 class LocalMap {
 public:
-    
+
     LocalMap(size_t size) : _keyframes(size) {};
-    
+
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> getKeyframes() { return _keyframes; }
-    
+
     void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { _keyframes.push_back(keyframe);}
-    
+
     /**
-     * @todo: 
+     * @todo:
      */
     pcl::PointCloud<PointXYZIR> getPointCloud() {
         pcl::PointCloud<PointXYZIR> localMapPCL;
@@ -279,7 +279,7 @@ private:
     // pcl::Indices indices(200);
     // std::iota(indices.begin(), indices.end(), 0);
 
-    
+
     LF.extract3DFeatures();
     Eigen::Isometry3f tf;
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();

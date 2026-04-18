@@ -28,8 +28,10 @@ target_link_libraries(feature_extraction
     OpenMP::OpenMP_CXX
 )
 
-install(
-  TARGETS feature_extraction
+install(TARGETS feature_extraction
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -52,6 +54,20 @@ set_target_properties(imu_preintegration PROPERTIES
 )
 
 install(TARGETS imu_preintegration
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+add_executable(global_map src/globalMap.cpp)
+ament_target_dependencies(global_map rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
+target_link_libraries(global_map ${PCL_LIBRARIES})
+
+set_target_properties(global_map PROPERTIES
+  INSTALL_RPATH "/opt/ros/humble/lib"
+  INSTALL_RPATH_USE_LINK_PATH FALSE
+  BUILD_WITH_INSTALL_RPATH TRUE
+)
+
+install(TARGETS global_map
   DESTINATION lib/${PROJECT_NAME}
 )
 
