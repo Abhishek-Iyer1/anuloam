@@ -4,7 +4,7 @@
 template <typename T>
 class CircularBuffer {
 public:
-    CircularBuffer(size_t size) : _isFull(false), _head(0), _maxSize(size) {
+    CircularBuffer(size_t size) : _head(0), _isFull(false), _maxSize(size) {
         _data.resize(size);
     }
 

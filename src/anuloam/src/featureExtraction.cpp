@@ -4,6 +4,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/common/transforms.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Geometry>
 #include <vector>
 #include "utils.hpp"
@@ -24,6 +26,12 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIR,
     (float, intensity, intensity)
     (std::uint16_t, ring, ring)
 )
+
+// Add these to see the template implementations for custom types
+#include <pcl/impl/pcl_base.hpp>
+#include <pcl/filters/impl/voxel_grid.hpp>
+#include <pcl/kdtree/impl/kdtree_flann.hpp>
+#include <pcl/search/impl/kdtree.hpp>
 
 struct PointRoughness {
     size_t index;
@@ -97,9 +105,9 @@ public:
         
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
-        int numSections = 8;
-        int edgeFeaturesPerSection = 2;
-        int planarFeaturesPerSection = 4;
+        size_t numSections = 8;
+        size_t edgeFeaturesPerSection = 2;
+        size_t planarFeaturesPerSection = 4;
 
         // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
@@ -152,17 +160,6 @@ public:
                 }
             }
 
-            // // if above a threshold (i.e. edge), then add to edge container
-            // if (( roughness > edgeThresh) && (currentFeatures < sectionFeatures)) {
-            //     _edges.push_back(ring[ind]);
-            //     currentFeatures++;
-            // }
-
-            // // if below a certain threshold (i.e. patch), then add to the patch container
-            // else if ((roughness < planarThresh) && (currentFeatures < sectionFeatures)) {
-            //     _patches.push_back(ring[ind]);
-            //     currentFeatures++;
-            // }
         }
 
         // TODO: Rejecting edge cases mentioned in the LOAM Paper (https://frc.ri.cmu.edu/~zhangji/publications/RSS_2014.pdf)
@@ -193,12 +190,15 @@ public:
         this->_features = this->_edges + this->_patches;
     }
 
-    /**
-     * @brief transforms the extracted lidar features by a given homogeneous transform
-     */
-    pcl::PointCloud<PointXYZIR> transform(const Eigen::Isometry3f& tf) const {
+    pcl::PointCloud<PointXYZIR> transformEdges(const Eigen::Isometry3f& tf) const {
         pcl::PointCloud<PointXYZIR> transformed;
-        pcl::transformPointCloud(this->getFeatures(), transformed, tf.matrix());
+        pcl::transformPointCloud(this->getEdges(), transformed, tf.matrix());
+        return transformed;
+    }
+
+    pcl::PointCloud<PointXYZIR> transformPatches(const Eigen::Isometry3f& tf) const {
+        pcl::PointCloud<PointXYZIR> transformed;
+        pcl::transformPointCloud(this->getPatches(), transformed, tf.matrix());
         return transformed;
     }
 
@@ -224,32 +224,86 @@ private:
     float maxRange = 20.0;
 };
 
+/**
+ * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud. 
+ * Challenge is the design of removal of earlier pointclouds
+ */
 class LocalMap {
 public:
     
-    LocalMap(size_t size) : _keyframes(size) {};
+    LocalMap(size_t size) : 
+        _keyframes(size),
+        _voxelEdges(new pcl::PointCloud<PointXYZIR>()),
+        _voxelPatches(new pcl::PointCloud<PointXYZIR>()),
+        _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
+    {}
     
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> getKeyframes() { return _keyframes; }
     
-    void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { _keyframes.push_back(keyframe);}
-    
     /**
-     * @todo: 
+     * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
      */
-    pcl::PointCloud<PointXYZIR> getPointCloud() {
-        pcl::PointCloud<PointXYZIR> localMapPCL;
-        // TODO: Create a new PointCloud and keep appending transformed pointCloud for all _keyframes.size().
-        for (size_t i = 0; i < _keyframes.size(); ++i) {
-            const auto& [frame, tf] = _keyframes[i];
-            localMapPCL += frame.transform(tf);
-        }
-        return localMapPCL;
+    void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { 
+        _keyframes.push_back(keyframe);
+        updateVoxelMaps();
     }
 
-    // Todo: Add a scanMatching method that takes in a LidarFrame and outputs a Eigen::Isometry3f which is the LO factor
+    void updateVoxelMaps() {
+        pcl::PointCloud<PointXYZIR>::Ptr rawEdges(new pcl::PointCloud<PointXYZIR>());
+        pcl::PointCloud<PointXYZIR>::Ptr rawPatches(new pcl::PointCloud<PointXYZIR>());
+
+        // Accumulate all features from the buffer window
+        for (size_t i = 0; i < _keyframes.size(); ++i) {
+            const auto& [frame, tf] = _keyframes[i];
+            *rawEdges += frame.transformEdges(tf);
+            *rawPatches += frame.transformPatches(tf);
+        }
+
+        *_upsampledPCL = *rawEdges;
+        *_upsampledPCL += *rawPatches;
+
+        // Downsample Edges (0.2m voxel length)
+        pcl::VoxelGrid<PointXYZIR> edgeFilter;
+        edgeFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+        edgeFilter.setInputCloud(rawEdges); 
+        edgeFilter.filter(*_voxelEdges);
+
+        // Downsample Patches (0.4m voxel length)
+        pcl::VoxelGrid<PointXYZIR> planeFilter;
+        planeFilter.setLeafSize(0.4f, 0.4f, 0.4f);
+        planeFilter.setInputCloud(rawPatches);
+        planeFilter.filter(*_voxelPatches);
+
+        // Build KD-Trees (used later for searching for nearest neighbours)
+        if (_voxelEdges->size() > 0) _kdtreeEdges.setInputCloud(_voxelEdges);
+        if (_voxelPatches->size() > 0) _kdtreePatches.setInputCloud(_voxelPatches);
+    }
+
+    // Find 2 neighbours for an edge point
+    bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) {
+        if (_voxelEdges->empty()) return false;
+        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
+    }
+
+    // Find 3 neighbours for a planar point
+    bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) {
+        if (_voxelPatches->empty()) return false;
+        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
+    }
+
+    pcl::PointCloud<PointXYZIR> getVoxels() { return *_voxelEdges + *_voxelPatches; }
+    pcl::PointCloud<PointXYZIR> getUpsampled() { return *_upsampledPCL; }
 
 private:
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
+    // Voxel Maps
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelEdges;
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelPatches;
+    pcl::PointCloud<PointXYZIR>::Ptr _upsampledPCL;
+
+    // Search Trees
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreeEdges;
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreePatches;
 };
 
 class FeatureExtraction : public rclcpp::Node {
@@ -283,7 +337,7 @@ private:
     LF.extract3DFeatures();
     Eigen::Isometry3f tf;
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
-    localMap.pushKeyframe({LF, tf.Identity()});
+    localMap.pushKeyframe({LF, Eigen::Isometry3f::Identity()});
 
     // for (size_t i = 0; i < subRing->points.size(); i++) {
     //     float azimuth = std::atan2(subRing->points[i].y, subRing->points[i].x) * 180.0 / M_PI;
@@ -291,7 +345,7 @@ private:
     // }
 
     sensor_msgs::msg::PointCloud2 localMapROS;
-    pcl::toROSMsg(localMap.getPointCloud(), localMapROS);
+    pcl::toROSMsg(localMap.getVoxels(), localMapROS);
     localMapROS.header = msg->header;
     pubLocalMap_->publish(localMapROS);
 
@@ -302,7 +356,7 @@ private:
 
     // Convert PCL -> ROS message and publish
     sensor_msgs::msg::PointCloud2 outputTest;
-    pcl::toROSMsg(rings[0], outputTest);
+    pcl::toROSMsg(localMap.getUpsampled(), outputTest);
     outputTest.header = msg->header;
     pubTest_->publish(outputTest);
   }
