@@ -94,9 +94,9 @@ class ImuPreintegration : public rclcpp::Node
       sensor_msgs::msg::Imu imu_meas = *msg;
 
       // integrate this imu message
-      double imuTime = imu_meas.header.stamp.sec + imu_meas.header.stamp.nanosec * 1e-9;
-      double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
-      lastImuT_imu = imuTime;
+      double imuTimeNow = imu_meas.header.stamp.sec + imu_meas.header.stamp.nanosec * 1e-9;
+      double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTimeNow - lastImuT_imu);
+      lastImuT_imu = imuTimeNow;
       imu_integrator_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
 
@@ -126,13 +126,16 @@ class ImuPreintegration : public rclcpp::Node
 
       odom_pub_->publish(odom_msg);
 
-      // publish path TODO NEED TO PUBLISH THIS AT LOWER HERTZAGE
-      geometry_msgs::msg::PoseStamped pose_stamped;
-      pose_stamped.header = odom_msg.header;
-      pose_stamped.pose = odom_msg.pose.pose;
-      path_.header = odom_msg.header;
-      path_.poses.push_back(pose_stamped);
-      path_pub_->publish(path_);
+      // publish path at 10 Hz
+      if (imuTimeNow - lastPathT_ >= 0.1) {
+        lastPathT_ = imuTimeNow;
+        geometry_msgs::msg::PoseStamped pose_stamped;
+        pose_stamped.header = odom_msg.header;
+        pose_stamped.pose = odom_msg.pose.pose;
+        path_.header = odom_msg.header;
+        path_.poses.push_back(pose_stamped);
+        path_pub_->publish(path_);
+      }
 
       // publish transform
       geometry_msgs::msg::TransformStamped tf_msg;
@@ -146,12 +149,26 @@ class ImuPreintegration : public rclcpp::Node
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+      // create gtsam object from ROS message
+      float p_x = msg->pose.pose.position.x;
+      float p_y = msg->pose.pose.position.y;
+      float p_z = msg->pose.pose.position.z;
+      float r_x = msg->pose.pose.orientation.x;
+      float r_y = msg->pose.pose.orientation.y;
+      float r_z = msg->pose.pose.orientation.z;
+      float r_w = msg->pose.pose.orientation.w;
+      gtsam::Pose3 lidar_pose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
+
       // create IMU factor
       const gtsam::PreintegratedCombinedMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements&>(*imu_integrator_);
       gtsam::CombinedImuFactor imu_factor(X(key-1), V(key-1), X(key), V(key), B(key-1), B(key), preint_imu);
 
-      // add factor to graph
+      // add IMU factor to graph
       graph_.add(imu_factor);
+
+      // create and add lidar factor
+      gtsam::PriorFactor<gtsam::Pose3> lidar_factor(X(key), lidar_pose); // prior factor because we have value = pose
+      graph_.add(lidar_factor);
 
       // add values
       // use imu preintegration prediction to initialize optimization
@@ -162,7 +179,7 @@ class ImuPreintegration : public rclcpp::Node
 
       // optimize
       isam2_.update(graph_, values_);
-      // isam2_.update(); // TODO: liosam updates twice, why??
+      // isam2_.update(); // TODO: liosam updates twice, do we need to?
 
       // update prev state with optimization
       gtsam::Values result = isam2_.calculateEstimate();
@@ -211,6 +228,7 @@ class ImuPreintegration : public rclcpp::Node
 
     int key = 1;
     double lastImuT_imu = -1;
+    double lastPathT_ = -1;
 
     // noise params - take from IMU datasheet
     float accel_noise_sigma_;
