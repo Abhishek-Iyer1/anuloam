@@ -35,7 +35,7 @@ class ImuPreintegration : public rclcpp::Node
         "/imu_correct", 10, std::bind(&ImuPreintegration::imuCallback, this, std::placeholders::_1)
       );
       odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/odom_incremental_TEMP", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
+        "/odom_incremental", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
       );
 
       // imu extrinsics 
@@ -164,6 +164,9 @@ class ImuPreintegration : public rclcpp::Node
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+      if (imu_q_.empty()) {
+        return;
+      }
       // create gtsam object from ROS message
       float p_x = msg->pose.pose.position.x;
       float p_y = msg->pose.pose.position.y;
@@ -176,6 +179,7 @@ class ImuPreintegration : public rclcpp::Node
 
       // create IMU factor
       // pop imu measurements from buffer until we sync timestamps with lidar msg
+      int imu_meas_count_opt_ = 0;
       while (!imu_q_.empty()) {
         sensor_msgs::msg::Imu imu_meas = imu_q_.front();
         double imu_time = stamp2sec(imu_meas.header.stamp);
@@ -186,10 +190,16 @@ class ImuPreintegration : public rclcpp::Node
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
           lastImuT_opt = imu_time;
           imu_q_.pop_front();
+          imu_meas_count_opt_++;
         } else {
           break;
         }
       }
+      if (imu_integrator_opt_->deltaTij() < 1e-6) {
+        RCLCPP_WARN(this->get_logger(), "No IMU measurements integrated for lidar frame key=%d (timestamp sync issue?), skipping", key);
+        return;
+      }
+      RCLCPP_INFO(this->get_logger(), "IMU factor key=%d: integrated %.4f sec (%d measurements)", key, imu_integrator_opt_->deltaTij(), imu_meas_count_opt_);
       const gtsam::PreintegratedCombinedMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements&>(*imu_integrator_opt_);
       gtsam::CombinedImuFactor imu_factor(X(key-1), V(key-1), X(key), V(key), B(key-1), B(key), preint_imu);
 
