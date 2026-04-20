@@ -12,6 +12,7 @@
 #include <pcl/kdtree/impl/kdtree_flann.hpp>
 #include <pcl/search/impl/kdtree.hpp>
 #include <pcl/impl/pcl_base.hpp>
+#include <pcl/filters/impl/voxel_grid.hpp>
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -309,7 +310,7 @@ public:
         if (_voxelEdges->size() > 0) _kdtreeEdges.setInputCloud(_voxelEdges);
         if (_voxelPatches->size() > 0) _kdtreePatches.setInputCloud(_voxelPatches);
     }
-
+    
     // Find 2 neighbours for an edge point
     bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelEdges->empty()) return false;
@@ -596,6 +597,7 @@ private:
 
         // Add the current keyframe to the local map
         localMap.pushKeyframe({LF, currentTf});
+        RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
         publishLocalMap(msg->header.stamp);
     }
@@ -722,9 +724,11 @@ private:
         pcl::PointCloud<PointXYZIR> combinedCloud;
         for (size_t i = 0; i < keyframes.size(); ++i) {
             const auto& [frame, tf] = keyframes[i];
-            pcl::PointCloud<PointXYZIR> transformed;
-            pcl::transformPointCloud(frame.getPCL(), transformed, tf.matrix());
-            combinedCloud += transformed;
+            pcl::PointCloud<PointXYZIR> transformedEdges, transformedPatches;
+            pcl::transformPointCloud(frame.getEdges(), transformedEdges, tf.matrix());
+            pcl::transformPointCloud(frame.getPatches(), transformedPatches, tf.matrix());
+            combinedCloud += transformedEdges;
+            combinedCloud += transformedPatches;
         }
         sensor_msgs::msg::PointCloud2 cloudMsg;
         pcl::toROSMsg(combinedCloud, cloudMsg);
