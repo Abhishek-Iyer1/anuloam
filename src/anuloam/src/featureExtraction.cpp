@@ -472,16 +472,12 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
 class FeatureExtraction : public rclcpp::Node {
 public:
-  // Increased Map buffer to 50 as requested
   FeatureExtraction() : Node("feature_extraction"), localMap(50) {
     // TODO: check what QoS profile to follow here
     imu_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         "/odom", 10, 
         std::bind(&FeatureExtraction::imuCallback, this, std::placeholders::_1));
         
-    // INCREASED QUEUE SIZE TO 50
-    // This guarantees that up to 50 unprocessed frames are buffered, and strictly
-    // drops anything beyond that to prevent unbounded memory growth.
     lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "/points_raw", 50,
         std::bind(&FeatureExtraction::pointCloudCallback, this, std::placeholders::_1));
@@ -532,7 +528,29 @@ private:
         return; 
     }
 
+    double cloud_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
     Eigen::Isometry3f tf_guess = current_lo_pose_;
+
+    // Use IMU orientation if available for the guess
+    if (!imu_q_.empty()) {
+        nav_msgs::msg::Odometry imu_odo_meas;
+        // TODO manage q with lock
+        while (!imu_q_.empty()) {
+            imu_odo_meas = imu_q_.front();
+            double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
+            if (imu_time > cloud_time) {
+                break;
+            }
+            imu_q_.pop_front();
+        }
+        
+        // Extract the orientation from the IMU message
+        const auto& o = imu_odo_meas.pose.pose.orientation;
+        Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
+        
+        // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
+        tf_guess.linear() = imu_quat.normalized().toRotationMatrix();
+    }
 
     auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
         sensor_msgs::msg::PointCloud2 scanMsg;
@@ -540,11 +558,6 @@ private:
         scanMsg.header = msg->header;
         scanMsg.header.frame_id = "map"; 
         pubTest_->publish(scanMsg); 
-        
-        // IMPORTANT: I have commented out the sleep. If this runs continuously
-        // and pauses 200ms every iteration, it will inherently lag behind even a 0.1x bag rate,
-        // rapidly filling the 50-frame buffer and forcing massive drops.
-        // rclcpp::sleep_for(std::chrono::milliseconds(200)); 
     };
 
     scanMatching(localMap, LF, tf_guess, visualizeIter);
@@ -565,7 +578,6 @@ private:
         float rotation_diff = std::abs(Eigen::AngleAxisf(delta.rotation()).angle());
 
         // Thresholds: 0.5 meters or ~5.7 degrees (0.1 radians)
-        // This ensures your 50-frame buffer covers a large geographic distance
         if (translation_diff > 0.5f || rotation_diff > 0.1f) { 
             should_add_keyframe = true;
         }
