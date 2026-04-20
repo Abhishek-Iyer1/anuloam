@@ -20,7 +20,6 @@
 #include <gtsam/nonlinear/Marginals.h>
 #include <gtsam/nonlinear/GaussNewtonOptimizer.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
-#include <gtsam/nonlinear/ISAM2.h>
 
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
@@ -314,13 +313,13 @@ public:
     // Find 2 neighbours for an edge point
     bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelEdges->empty()) return false;
-        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
+        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) == 2;
     }
 
     // Find 3 neighbours for a planar point
     bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelPatches->empty()) return false;
-        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
+        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) == 3;
     }
 
     const pcl::PointCloud<PointXYZIR>& getEdges() const { return *_voxelEdges; }
@@ -329,7 +328,7 @@ public:
     /**
         * @note: ONLY for internal testing
         */
-    pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
+    const pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
 
 private:
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
@@ -483,6 +482,10 @@ public:
             "/odom_global",
             10
         );
+        pubLocalMapDebug_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/local_map_lidar",
+            10
+        );
 
 
         // Noise models (Covariances)
@@ -507,6 +510,7 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subImuOdom_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubIncrementalOdom_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubGlobalOdom_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMapDebug_;
 
     // LiDAR processing
     LocalMap localMap;
@@ -545,14 +549,16 @@ private:
         LF.extract3DFeatures();
 
         // @todo: Perform Scan Matching
-        Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
+        const auto& keyframes = localMap.getKeyframes();
+        Eigen::Isometry3f currentTf = keyframes.empty()
+            ? Eigen::Isometry3f::Identity()
+            : keyframes.back().second;
         scanMatching(localMap, LF, currentTf);
 
         // TODO: Get relative pose. Scan matching gives pose wrt first frame
         // Get the last stored LidarFrame and tf pair from the local map circular buffer
         Eigen::Isometry3f relative_pose = currentTf;
         bool isKeyFrame = false;
-        const auto& keyframes = localMap.getKeyframes();
         if (!keyframes.empty()) {
             const auto& [lastLidarFrame, lastTf] = keyframes.back();
             relative_pose = lastTf.inverse() * currentTf;
@@ -590,17 +596,12 @@ private:
 
         // Add the current keyframe to the local map
         localMap.pushKeyframe({LF, currentTf});
+
+        publishLocalMap(msg->header.stamp);
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
         // @todo: Implement IMU-based odometry update
-    }
-
-    gtsam::Pose3 performScanMatching(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud) {
-        // @todo: Implement PCL GICP/NDT registration here.
-        // Match 'cloud' against your maintained sliding window map.
-        // Return the resulting transform as a GTSAM Pose3.
-        return gtsam::Pose3();
     }
 
     void updateGraph(const gtsam::Pose3& odomStep) {
@@ -677,9 +678,14 @@ private:
         icp.setMaximumIterations(100);
         icp.setTransformationEpsilon(1e-6);
         icp.setEuclideanFitnessEpsilon(1e-6);
-
+        icp.setInputSource(currentCloud);
+        icp.setInputTarget(cloudKeyframes_[loopMatchID]);
+        gtsam::Values estimate = isam_->calculateEstimate();
+        gtsam::Pose3 pCurrent = currentPoseEstimate;
+        gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
+        Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
         pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
-        icp.align(*unused_result);
+        icp.align(*unused_result, initialGuess);
 
         // 6. Evaluate and Add to Graph
         if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
@@ -709,6 +715,22 @@ private:
 
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             historicalKey, currentKey, loopPose, loopNoise));
+    }
+
+    void publishLocalMap(const rclcpp::Time& timestamp) {
+        const auto& keyframes = localMap.getKeyframes();
+        pcl::PointCloud<PointXYZIR> combinedCloud;
+        for (size_t i = 0; i < keyframes.size(); ++i) {
+            const auto& [frame, tf] = keyframes[i];
+            pcl::PointCloud<PointXYZIR> transformed;
+            pcl::transformPointCloud(frame.getPCL(), transformed, tf.matrix());
+            combinedCloud += transformed;
+        }
+        sensor_msgs::msg::PointCloud2 cloudMsg;
+        pcl::toROSMsg(combinedCloud, cloudMsg);
+        cloudMsg.header.stamp = timestamp;
+        cloudMsg.header.frame_id = "map";
+        pubLocalMapDebug_->publish(cloudMsg);
     }
 
     void publishIncrementalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
