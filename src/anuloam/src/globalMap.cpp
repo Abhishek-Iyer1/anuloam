@@ -7,6 +7,9 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/impl/kdtree_flann.hpp>
+#include <pcl/search/impl/kdtree.hpp>
+#include <pcl/impl/pcl_base.hpp>
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -21,6 +24,419 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/inference/Symbol.h>
 
+#include <Eigen/Geometry>
+
+namespace {
+
+// gtsam::Pose3 uses double; scan matching uses float transforms
+gtsam::Pose3 eigenIsometryToPose3(const Eigen::Isometry3f& T) {
+    return gtsam::Pose3(
+        gtsam::Rot3(T.rotation().cast<double>()),
+        gtsam::Point3(T.translation().cast<double>())
+    );
+}
+
+Eigen::Isometry3f pose3ToEigenIsometry(const gtsam::Pose3& pose) {
+    return Eigen::Isometry3f(
+        pose.rotation().toRotationMatrix(),
+        Eigen::Vector3f(pose.translation().x(), pose.translation().y(), pose.translation().z())
+    );
+}
+
+}  // namespace
+
+struct PointRoughness {
+    size_t index;
+    float roughness;
+};
+
+
+
+/**
+ *  @todo: Need to support each point in the scan having a timestamp parameter
+ */
+class LidarFrame {
+public:
+    LidarFrame() = default;
+    LidarFrame(const pcl::PointCloud<PointXYZIR>& cloud) : _pcl (cloud) {};
+    LidarFrame(const sensor_msgs::msg::PointCloud2& msg) { pcl::fromROSMsg(msg, _pcl); }
+
+    /**
+        * @brief extract 2D scans for every ring in the 3D pointcloud scan
+        * @param cloud 3D input scan of with ring information
+        */
+    void extractRings(const pcl::PointCloud<PointXYZIR>& cloud) {
+
+        // extract indices for each point and form populate ```rings```
+        std::vector<std::vector<int>> ringIndices(NUM_RINGS, std::vector<int>());
+        for (size_t j=0; j<cloud.points.size(); j++) {
+            ringIndices[cloud.points[j].ring].push_back(j);
+        }
+        for (size_t ring=0; ring<NUM_RINGS; ring++) {
+            _rings.emplace_back(cloud, pcl::Indices(ringIndices[ring]));
+        }
+    };
+
+    float computeRoughness(const pcl::PointCloud<PointXYZIR>& ring, size_t ind) {
+
+        float norm = ring[ind].x * ring[ind].x + ring[ind].y * ring[ind].y + ring[ind].z * ring[ind].z;
+        if (norm < minRange * minRange || norm > maxRange * maxRange) {
+            return -1.0f; // r < 0 filtered out later
+        }
+
+        size_t scanSize = ring.size();
+        int setStart = -(neighbours / 2);
+        int setEnd = (neighbours / 2);
+
+        float sumX = 0, sumY = 0, sumZ = 0;
+
+        for (int j = setStart; j <= setEnd; j++) {
+            if (j == 0) continue;
+            size_t wrapped = (ind + j + scanSize) % scanSize;
+            sumX += ring[ind].x - ring[wrapped].x;
+            sumY += ring[ind].y - ring[wrapped].y;
+            sumZ += ring[ind].z - ring[wrapped].z;
+        }
+
+        return (sumX * sumX + sumY * sumY + sumZ * sumZ) / (neighbours * neighbours * norm);
+    }
+
+    /**
+        * @brief extract edge and patch features from 2D scans (rings)
+        * @param ring 2D Pointcloud with all the points from the same ring arranged in a consecutive order
+        * @param neighbours number of neighbours to consider in the set when calculating roughness (|S|, cardinality of set)
+        * @param edgeThresh the roughness threshold above which a point is considered an edge
+        * @param planarThresh the roughness threshold below which a point is considered a patch
+        * @param totalFeatures the number of total features to extract from a 2D scan
+        * @todo: Multithreading
+        */
+    void extract2DFeatures(
+        const pcl::PointCloud<PointXYZIR>& ring,
+        pcl::PointCloud<PointXYZIR>& edgeFeatures,
+        pcl::PointCloud<PointXYZIR>& planarFeatures
+    ) {
+
+        // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
+        size_t scanSize = ring.size();
+        size_t numSections = 8;
+        size_t edgeFeaturesPerSection = 2;
+        size_t planarFeaturesPerSection = 4;
+
+        // Add 2 edge and 4 planar features per section to LidarFrames
+        for (size_t section=1; section <= numSections; section++) {
+
+            size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
+            size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
+            size_t currentFeatures = 0;
+            size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
+
+            // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
+
+            std::vector<PointRoughness> roughnesses;
+            roughnesses.reserve(endInd - startInd);
+
+            for (size_t ind = startInd; ind < endInd; ind++) {
+                float r = computeRoughness(ring, ind);
+                if (r < 0) continue;
+                roughnesses.push_back({ind, r});
+            }
+
+            // append k roughest points (i.e. edges) to _edges
+            size_t kEdge = std::min(static_cast<size_t>(edgeFeaturesPerSection), roughnesses.size());
+
+            std::partial_sort(
+                roughnesses.begin(),
+                roughnesses.begin() + kEdge,
+                roughnesses.end(),
+                [](const auto& a, const auto& b) { return a.roughness > b.roughness; }
+            );
+
+            for (size_t i = 0; i < edgeFeaturesPerSection && i < roughnesses.size(); i++) {
+                if (roughnesses[i].roughness > edgeThresh) {
+                    edgeFeatures.push_back(ring[roughnesses[i].index]);
+                }
+            }
+
+            // append k smoothest points (i.e. patches) to _patches
+            size_t kPatch = std::min(static_cast<size_t>(planarFeaturesPerSection), roughnesses.size());
+
+            std::partial_sort(
+                roughnesses.begin(),
+                roughnesses.begin() + kPatch,
+                roughnesses.end(),
+                [](const auto& a, const auto& b) { return a.roughness < b.roughness; }
+            );
+
+            for (size_t i = 0; i < planarFeaturesPerSection && i < roughnesses.size(); i++) {
+                if (roughnesses[i].roughness < planarThresh) {
+                    planarFeatures.push_back(ring[roughnesses[i].index]);
+                }
+            }
+
+        }
+
+        // TODO: Rejecting edge cases mentioned in the LOAM Paper (https://frc.ri.cmu.edu/~zhangji/publications/RSS_2014.pdf)
+    }
+
+    /**
+        * @brief extract edge and patch features from the 3D scan by stacking 2D features (extract2DFeatures)
+        * @todo: Multithreading
+        */
+    void extract3DFeatures() {
+        this->extractRings(_pcl);
+
+        // create buckets per ring to containerize the memory accessed by each thread
+        std::vector<pcl::PointCloud<PointXYZIR>> edgeBuckets(NUM_RINGS);
+        std::vector<pcl::PointCloud<PointXYZIR>> planarBuckets(NUM_RINGS);
+
+        #pragma omp parallel for num_threads(8)
+        for (size_t i=0; i<NUM_RINGS; i++) {
+            this->extract2DFeatures(this->_rings[i], edgeBuckets[i], planarBuckets[i]);
+        }
+
+        // collate returned data back into the edge and patches
+        for (size_t i=0; i<NUM_RINGS; i++) {
+            this->_edges += edgeBuckets[i];
+            this->_patches += planarBuckets[i];
+        }
+
+        this->_features = this->_edges + this->_patches;
+    }
+
+    pcl::PointCloud<PointXYZIR> transformEdges(const Eigen::Isometry3f& tf) const {
+        pcl::PointCloud<PointXYZIR> transformed;
+        pcl::transformPointCloud(this->getEdges(), transformed, tf.matrix());
+        return transformed;
+    }
+
+    pcl::PointCloud<PointXYZIR> transformPatches(const Eigen::Isometry3f& tf) const {
+        pcl::PointCloud<PointXYZIR> transformed;
+        pcl::transformPointCloud(this->getPatches(), transformed, tf.matrix());
+        return transformed;
+    }
+
+    // TODO: How to protect against getRings() called when rings is empty?
+    // TODO: Don't need to store R in the point if I already have them in rings
+    std::vector<pcl::PointCloud<PointXYZIR>> getRings() { return _rings; }
+    pcl::PointCloud<PointXYZIR> getPCL() const {return _pcl;}
+    pcl::PointCloud<PointXYZIR> getEdges() const {return _edges;}
+    pcl::PointCloud<PointXYZIR> getPatches() const {return _patches;}
+    const pcl::PointCloud<PointXYZIR>& getFeatures() const { return _features; }
+
+private:
+    pcl::PointCloud<PointXYZIR> _pcl;
+    std::vector<pcl::PointCloud<PointXYZIR>> _rings;
+    pcl::PointCloud<PointXYZIR> _edges;
+    pcl::PointCloud<PointXYZIR> _patches;
+    pcl::PointCloud<PointXYZIR> _features;
+    int neighbours = 16;
+    float edgeThresh = 0.25;
+    float planarThresh = 1e-4; //1e-4;
+    int totalFeatures = 32;
+    float minRange = 1.0;
+    float maxRange = 20.0;
+};
+
+
+class LocalMap {
+public:
+
+    LocalMap(size_t size) :
+        _keyframes(size),
+        _voxelEdges(new pcl::PointCloud<PointXYZIR>()),
+        _voxelPatches(new pcl::PointCloud<PointXYZIR>()),
+        _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
+    {}
+
+    const CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>>& getKeyframes() const { return _keyframes; }
+
+    /**
+        * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
+        */
+    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
+        _keyframes.push_back(keyframe);
+        updateVoxelMaps();
+    }
+
+    void updateVoxelMaps() {
+        pcl::PointCloud<PointXYZIR>::Ptr rawEdges(new pcl::PointCloud<PointXYZIR>());
+        pcl::PointCloud<PointXYZIR>::Ptr rawPatches(new pcl::PointCloud<PointXYZIR>());
+
+        // Accumulate all features from the buffer window
+        for (size_t i = 0; i < _keyframes.size(); ++i) {
+            const auto& [frame, tf] = _keyframes[i];
+            *rawEdges += frame.transformEdges(tf);
+            *rawPatches += frame.transformPatches(tf);
+        }
+
+        *_upsampledPCL = *rawEdges;
+        *_upsampledPCL += *rawPatches;
+
+        // Downsample Edges (0.2m voxel length)
+        pcl::VoxelGrid<PointXYZIR> edgeFilter;
+        edgeFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+        edgeFilter.setInputCloud(rawEdges);
+        edgeFilter.filter(*_voxelEdges);
+
+        // Downsample Patches (0.4m voxel length)
+        pcl::VoxelGrid<PointXYZIR> planeFilter;
+        planeFilter.setLeafSize(0.4f, 0.4f, 0.4f);
+        planeFilter.setInputCloud(rawPatches);
+        planeFilter.filter(*_voxelPatches);
+
+        // Build KD-Trees (used later for searching for nearest neighbours)
+        if (_voxelEdges->size() > 0) _kdtreeEdges.setInputCloud(_voxelEdges);
+        if (_voxelPatches->size() > 0) _kdtreePatches.setInputCloud(_voxelPatches);
+    }
+
+    // Find 2 neighbours for an edge point
+    bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
+        if (_voxelEdges->empty()) return false;
+        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
+    }
+
+    // Find 3 neighbours for a planar point
+    bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
+        if (_voxelPatches->empty()) return false;
+        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
+    }
+
+    const pcl::PointCloud<PointXYZIR>& getEdges() const { return *_voxelEdges; }
+    const pcl::PointCloud<PointXYZIR>& getPatches() const { return *_voxelPatches; }
+    pcl::PointCloud<PointXYZIR> getVoxels() const { return *_voxelEdges + *_voxelPatches; }
+    /**
+        * @note: ONLY for internal testing
+        */
+    pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
+
+private:
+    CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
+    // Voxel Maps
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelEdges;
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelPatches;
+    pcl::PointCloud<PointXYZIR>::Ptr _upsampledPCL;
+
+    // Search Trees
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreeEdges;
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreePatches;
+};
+
+/**
+    * @note: Both map and target must be in a common frame
+    */
+void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess) {
+
+    if (map.getKeyframes().size() == 0) {return;}
+    const int maxIterations = 10;
+    const float epsilon = 1e-4;
+    const float maxDistSq = 1.0;
+
+    for (int iter = 0; iter < maxIterations; ++iter) {
+
+        // Go over the incoming LidarFrame
+        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
+        Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
+
+        const pcl::PointCloud<PointXYZIR> transformedEdges = target.transformEdges(currentGuess);
+        const pcl::PointCloud<PointXYZIR> transformedPatches = target.transformPatches(currentGuess);
+
+        for (const auto& edge : transformedEdges) {
+            Eigen::Vector3f pi = edge.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+            if (map.findEdgeNeighbors(edge, indices, dists)) {
+                if (dists[1] > maxDistSq) continue;
+
+                Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                if ((pj - pl).norm() < 0.1f) continue;
+
+                // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
+                // vUnit = (pj - pl) / || pj - pl ||
+                // Jacobian = [ [vUnit]_x @ [P_i]_x     -[vUnit]_x ]
+                // b_i = [e_0]_x @ vUnit
+                Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
+                Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
+
+                // Initialize a fixed-size 3x6 matrix
+                Eigen::Matrix<float, 3, 6> Ai;
+
+                Eigen::Matrix3f vSkew = skew(vUnit);
+                Eigen::Matrix3f pSkew = skew(pi);
+
+                // Left side: Rotation (delta_theta) -> [vUnit]_x * [pi]_x
+                Ai.leftCols<3>() = vSkew * pSkew;
+
+                // Right side: Translation (delta_t) -> -[vUnit]_x
+                Ai.rightCols<3>() = -vSkew;
+
+                H.noalias() += Ai.transpose() * Ai;
+                g.noalias() += Ai.transpose() * bi;
+
+            }
+        }
+
+        for (const auto& patch : transformedPatches) {
+            Eigen::Vector3f pi = patch.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+
+            if (map.findPlaneNeighbors(patch, indices, dists)) {
+                if (dists[2] > maxDistSq) continue;
+
+                Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
+                Eigen::Vector3f pw = (map.getPatches())[indices[2]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                Eigen::Vector3f normal = (pu - pv).cross(pu - pw);
+                float normalMag = normal.norm();
+                Eigen::Vector3f unitNormal = normal / normalMag;
+
+                if (normalMag < 0.1f) continue;
+                // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
+                // unit_normal = (pu - pv) x  (pw - pv) / ||(pu - pv) x  (pw - pv)||
+                // Jacobian = [(pi x ni).T      unit_normal.T]
+                // b_i = unit_normal.T @ (pi - pv)
+
+                float bi = unitNormal.transpose().dot(pi - pv);
+                Eigen::Matrix<float, 1, 6> Ai;
+                Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
+                Ai.rightCols<3>() = unitNormal.transpose();
+
+                H.noalias() += Ai.transpose() * Ai;
+                g.noalias() += Ai.transpose() * bi;
+            }
+        }
+
+        Eigen::Vector<float, 6> deltaTransform = H.ldlt().solve(-g);
+
+        Eigen::Isometry3f nudge = Eigen::Isometry3f::Identity();
+        float angle = deltaTransform.head<3>().norm();
+        if (angle > 1e-6) {
+            Eigen::Vector3f axis = deltaTransform.head<3>() / angle;
+            nudge.linear() = Eigen::AngleAxisf(angle, axis).toRotationMatrix();
+        } else {
+            // Fallback to identity + skew for infinitesimally small angles to avoid div by zero
+            nudge.linear() = Eigen::Matrix3f::Identity() + skew(deltaTransform.head<3>());
+        }
+
+        nudge.translation() = deltaTransform.tail<3>();
+        currentGuess = nudge * currentGuess;
+
+        Eigen::Quaternionf q(currentGuess.linear());
+        currentGuess.linear() = q.normalized().toRotationMatrix();
+
+        if (deltaTransform.norm() < epsilon) {
+            break;
+        }
+
+    }
+
+}
+
 
 
 class GlobalMapNode : public rclcpp::Node {
@@ -33,14 +449,19 @@ public:
             std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1)
         );
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom_incremental",
+            "/odom_imu",
             10,
             std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1)
         );
-        pubLidarOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(
-            "/lidar_odom",
+        pubIncrementalOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(
+            "/odom_incremental",
             10
         );
+        pubGlobalOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(
+            "/odom_global",
+            10
+        );
+
 
         // Noise models (Covariances)
         gtsam::Vector6 prior_sigmas;
@@ -62,7 +483,13 @@ private:
     // Subs and pubs
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subPoints_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subImuOdom_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLidarOdom_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubIncrementalOdom_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubGlobalOdom_;
+
+    // LiDAR processing
+    LocalMap localMap;
+    const float keyframeTranslationThresh_ = 0.3f;   // 30 cm
+    const float keyframeRotationThresh_ = 0.2618f;   // ~15 degrees in radians
 
     // Factor graph variables
     int keyFrameID = 0;
@@ -92,11 +519,36 @@ private:
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
 
+        LidarFrame LF = LidarFrame(*msg);
+        pcl::PointCloud<PointXYZIR> subCloud = LF.getPCL();
+        LF.extractRings(subCloud);
+        LF.extract3DFeatures();
+        pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
+
         // @todo: Perform Scan Matching
-        gtsam::Pose3 relative_pose = performScanMatching(currentCloud);
+        Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
+        scanMatching(localMap, LF, currentTf);
+
+        // TODO: Get relative pose. Scan matching gives pose wrt first frame
+        // Get the last stored LidarFrame and tf pair from the local map circular buffer
+        Eigen::Isometry3f relative_pose = currentTf;
+        bool isKeyFrame = false;
+        const auto& keyframes = localMap.getKeyframes();
+        if (!keyframes.empty()) {
+            const auto& [lastLidarFrame, lastTf] = keyframes.back();
+            relative_pose = lastTf.inverse() * currentTf;
+            Eigen::AngleAxisf aa(relative_pose.rotation());
+            isKeyFrame = (relative_pose.translation().norm() < keyframeTranslationThresh_ && aa.angle() < keyframeRotationThresh_);
+            if (isKeyFrame) {
+                return;
+            }
+        }
+
+        // TODO: Publish whatever scan matching gives as the continuous odometry
+        publishIncrementalOdometry(currentTf, msg->header.stamp);
 
         // @todo: Update Factor Graph with the pose
-        updateGraph(relative_pose);
+        updateGraph(eigenIsometryToPose3(relative_pose));
 
         // @todo: Detect Loop Closure
         detectLoopClosure(currentCloud);
@@ -109,9 +561,10 @@ private:
         gtSAMgraph_.resize(0);
         initialEstimate_.clear();
 
-        // 6. Publish Odometry and TF
+        // Publish global odometry
         gtsam::Values currentEstimate = isam_->calculateEstimate();
-        publishLidarOdometry(currentEstimate, msg->header.stamp);
+        Eigen::Isometry3f CurrentGlobalTf = pose3ToEigenIsometry(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', keyFrameID - 1)));
+        publishGlobalOdometry(CurrentGlobalTf, msg->header.stamp);
 
         // Add logging
         RCLCPP_INFO(this->get_logger(), "Received %zu points", currentCloud->points.size());
@@ -136,7 +589,7 @@ private:
         if (keyFrameID == 0) {
             // Add a PriorFactor to anchor the graph at the origin.
             gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(
-                currentKey, gtsam::Pose3::identity(), priorNoise_)
+                currentKey, gtsam::Pose3::identity(), prior_noise_)
             );
             // Add the initial guess (Identity)
             initialEstimate_.insert(currentKey, gtsam::Pose3::identity());
@@ -146,7 +599,7 @@ private:
         }
 
         gtsam::Symbol previousKey('X', keyFrameID - 1);
-        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(previousKey, currentKey, odomStep, odomNoise_));
+        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(previousKey, currentKey, odomStep, odom_noise_));
         currentPoseEstimate = currentPoseEstimate.compose(odomStep);
         initialEstimate_.insert(currentKey, currentPoseEstimate);
         keyFrameID++;
@@ -236,16 +689,36 @@ private:
             historicalKey, currentKey, loopPose, loopNoise));
     }
 
-    void publishLidarOdometry(const gtsam::Values& currentEstimate, const rclcpp::Time& timestamp) {
-        nav_msgs::Odometry lidarOdom;
-        lidarOdom.header.stamp = timestamp;
-        lidarOdom.header.frame_id = "odom";
-        lidarOdom.child_frame_id = "lidar";
-        lidarOdom.pose.pose.position.x = currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', 0)).translation().x();
-        lidarOdom.pose.pose.position.y = currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', 0)).translation().y();
-        lidarOdom.pose.pose.position.z = currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', 0)).translation().z();
-        lidarOdom.pose.pose.orientation = currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', 0)).rotation().toQuaternion();
-        pubLidarOdom_->publish(lidarOdom);
+    void publishIncrementalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
+        nav_msgs::msg::Odometry odomMsg;
+        odomMsg.header.stamp = timestamp;
+        odomMsg.header.frame_id = "map";
+        odomMsg.child_frame_id = "lidar";
+        odomMsg.pose.pose.position.x = currentTf.translation().x();
+        odomMsg.pose.pose.position.y = currentTf.translation().y();
+        odomMsg.pose.pose.position.z = currentTf.translation().z();
+        Eigen::Quaternionf q(currentTf.rotation());
+        odomMsg.pose.pose.orientation.x = q.x();
+        odomMsg.pose.pose.orientation.y = q.y();
+        odomMsg.pose.pose.orientation.z = q.z();
+        odomMsg.pose.pose.orientation.w = q.w();
+        pubIncrementalOdom_->publish(odomMsg);
+    }
+
+    void publishGlobalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
+        nav_msgs::msg::Odometry odomMsg;
+        odomMsg.header.stamp = timestamp;
+        odomMsg.header.frame_id = "map";
+        odomMsg.child_frame_id = "lidar";
+        odomMsg.pose.pose.position.x = currentTf.translation().x();
+        odomMsg.pose.pose.position.y = currentTf.translation().y();
+        odomMsg.pose.pose.position.z = currentTf.translation().z();
+        Eigen::Quaternionf q(currentTf.rotation());
+        odomMsg.pose.pose.orientation.x = q.x();
+        odomMsg.pose.pose.orientation.y = q.y();
+        odomMsg.pose.pose.orientation.z = q.z();
+        odomMsg.pose.pose.orientation.w = q.w();
+        pubGlobalOdom_->publish(odomMsg);
     }
 };
 

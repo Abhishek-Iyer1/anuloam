@@ -225,25 +225,25 @@ private:
 };
 
 /**
- * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud. 
+ * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud.
  * Challenge is the design of removal of earlier pointclouds
  */
 class LocalMap {
 public:
-    
-    LocalMap(size_t size) : 
+
+    LocalMap(size_t size) :
         _keyframes(size),
         _voxelEdges(new pcl::PointCloud<PointXYZIR>()),
         _voxelPatches(new pcl::PointCloud<PointXYZIR>()),
         _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
     {}
-    
+
     const CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>>& getKeyframes() const { return _keyframes; }
-    
+
     /**
      * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
      */
-    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) { 
+    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
@@ -265,7 +265,7 @@ public:
         // Downsample Edges (0.2m voxel length)
         pcl::VoxelGrid<PointXYZIR> edgeFilter;
         edgeFilter.setLeafSize(0.2f, 0.2f, 0.2f);
-        edgeFilter.setInputCloud(rawEdges); 
+        edgeFilter.setInputCloud(rawEdges);
         edgeFilter.filter(*_voxelEdges);
 
         // Downsample Patches (0.4m voxel length)
@@ -322,7 +322,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
     const float maxDistSq = 1.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
-            
+
         // Go over the incoming LidarFrame
         Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
         Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
@@ -335,21 +335,21 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<int> indices;
             std::vector<float> dists;
             if (map.findEdgeNeighbors(edge, indices, dists)) {
-                if (dists[1] > maxDistSq) continue; 
+                if (dists[1] > maxDistSq) continue;
 
                 Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
 
                 // Verification: Line segment must have non-zero length
                 if ((pj - pl).norm() < 0.1f) continue;
-                
+
                 // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
                 // vUnit = (pj - pl) / || pj - pl ||
                 // Jacobian = [ [vUnit]_x @ [P_i]_x     -[vUnit]_x ]
                 // b_i = [e_0]_x @ vUnit
                 Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
                 Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
-                
+
                 // Initialize a fixed-size 3x6 matrix
                 Eigen::Matrix<float, 3, 6> Ai;
 
@@ -362,9 +362,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // Right side: Translation (delta_t) -> -[vUnit]_x
                 Ai.rightCols<3>() = -vSkew;
 
-                H.noalias() += Ai.transpose() * Ai; 
+                H.noalias() += Ai.transpose() * Ai;
                 g.noalias() += Ai.transpose() * bi;
-        
+
             }
         }
 
@@ -374,7 +374,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<float> dists;
 
             if (map.findPlaneNeighbors(patch, indices, dists)) {
-                if (dists[2] > maxDistSq) continue; 
+                if (dists[2] > maxDistSq) continue;
 
                 Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
@@ -396,7 +396,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
                 Ai.rightCols<3>() = unitNormal.transpose();
 
-                H.noalias() += Ai.transpose() * Ai; 
+                H.noalias() += Ai.transpose() * Ai;
                 g.noalias() += Ai.transpose() * bi;
             }
         }
@@ -412,7 +412,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             // Fallback to identity + skew for infinitesimally small angles to avoid div by zero
             nudge.linear() = Eigen::Matrix3f::Identity() + skew(deltaTransform.head<3>());
         }
-            
+
         nudge.translation() = deltaTransform.tail<3>();
         currentGuess = nudge * currentGuess;
 
@@ -422,7 +422,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         if (deltaTransform.norm() < epsilon) {
             break;
         }
-    
+
     }
 
 }
@@ -448,6 +448,7 @@ private:
     LidarFrame LF = LidarFrame(*msg);
     pcl::PointCloud<PointXYZIR> subCloud = LF.getPCL();
     LF.extractRings(subCloud);
+
     std::vector<pcl::PointCloud<PointXYZIR>> rings = LF.getRings();
 
     // Convert PCL -> ROS message and publish
