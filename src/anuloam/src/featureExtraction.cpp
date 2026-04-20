@@ -4,6 +4,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/common/transforms.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Geometry>
 #include <vector>
 #include "utils.hpp"
@@ -24,6 +26,12 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIR,
     (float, intensity, intensity)
     (std::uint16_t, ring, ring)
 )
+
+// Add these to see the template implementations for custom types
+#include <pcl/impl/pcl_base.hpp>
+#include <pcl/filters/impl/voxel_grid.hpp>
+#include <pcl/kdtree/impl/kdtree_flann.hpp>
+#include <pcl/search/impl/kdtree.hpp>
 
 struct PointRoughness {
     size_t index;
@@ -97,9 +105,9 @@ public:
 
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
-        int numSections = 8;
-        int edgeFeaturesPerSection = 2;
-        int planarFeaturesPerSection = 4;
+        size_t numSections = 8;
+        size_t edgeFeaturesPerSection = 2;
+        size_t planarFeaturesPerSection = 4;
 
         // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
@@ -152,17 +160,6 @@ public:
                 }
             }
 
-            // // if above a threshold (i.e. edge), then add to edge container
-            // if (( roughness > edgeThresh) && (currentFeatures < sectionFeatures)) {
-            //     _edges.push_back(ring[ind]);
-            //     currentFeatures++;
-            // }
-
-            // // if below a certain threshold (i.e. patch), then add to the patch container
-            // else if ((roughness < planarThresh) && (currentFeatures < sectionFeatures)) {
-            //     _patches.push_back(ring[ind]);
-            //     currentFeatures++;
-            // }
         }
 
         // TODO: Rejecting edge cases mentioned in the LOAM Paper (https://frc.ri.cmu.edu/~zhangji/publications/RSS_2014.pdf)
@@ -193,12 +190,15 @@ public:
         this->_features = this->_edges + this->_patches;
     }
 
-    /**
-     * @brief transforms the extracted lidar features by a given homogeneous transform
-     */
-    pcl::PointCloud<PointXYZIR> transform(const Eigen::Isometry3f& tf) const {
+    pcl::PointCloud<PointXYZIR> transformEdges(const Eigen::Isometry3f& tf) const {
         pcl::PointCloud<PointXYZIR> transformed;
-        pcl::transformPointCloud(this->getFeatures(), transformed, tf.matrix());
+        pcl::transformPointCloud(this->getEdges(), transformed, tf.matrix());
+        return transformed;
+    }
+
+    pcl::PointCloud<PointXYZIR> transformPatches(const Eigen::Isometry3f& tf) const {
+        pcl::PointCloud<PointXYZIR> transformed;
+        pcl::transformPointCloud(this->getPatches(), transformed, tf.matrix());
         return transformed;
     }
 
@@ -224,33 +224,208 @@ private:
     float maxRange = 20.0;
 };
 
+/**
+ * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud. 
+ * Challenge is the design of removal of earlier pointclouds
+ */
 class LocalMap {
 public:
-
-    LocalMap(size_t size) : _keyframes(size) {};
-
-    CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> getKeyframes() { return _keyframes; }
-
-    void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { _keyframes.push_back(keyframe);}
-
+    
+    LocalMap(size_t size) : 
+        _keyframes(size),
+        _voxelEdges(new pcl::PointCloud<PointXYZIR>()),
+        _voxelPatches(new pcl::PointCloud<PointXYZIR>()),
+        _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
+    {}
+    
+    const CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>>& getKeyframes() const { return _keyframes; }
+    
     /**
-     * @todo:
+     * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
      */
-    pcl::PointCloud<PointXYZIR> getPointCloud() {
-        pcl::PointCloud<PointXYZIR> localMapPCL;
-        // TODO: Create a new PointCloud and keep appending transformed pointCloud for all _keyframes.size().
-        for (size_t i = 0; i < _keyframes.size(); ++i) {
-            const auto& [frame, tf] = _keyframes[i];
-            localMapPCL += frame.transform(tf);
-        }
-        return localMapPCL;
+    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) { 
+        _keyframes.push_back(keyframe);
+        updateVoxelMaps();
     }
 
-    // Todo: Add a scanMatching method that takes in a LidarFrame and outputs a Eigen::Isometry3f which is the LO factor
+    void updateVoxelMaps() {
+        pcl::PointCloud<PointXYZIR>::Ptr rawEdges(new pcl::PointCloud<PointXYZIR>());
+        pcl::PointCloud<PointXYZIR>::Ptr rawPatches(new pcl::PointCloud<PointXYZIR>());
+
+        // Accumulate all features from the buffer window
+        for (size_t i = 0; i < _keyframes.size(); ++i) {
+            const auto& [frame, tf] = _keyframes[i];
+            *rawEdges += frame.transformEdges(tf);
+            *rawPatches += frame.transformPatches(tf);
+        }
+
+        *_upsampledPCL = *rawEdges;
+        *_upsampledPCL += *rawPatches;
+
+        // Downsample Edges (0.2m voxel length)
+        pcl::VoxelGrid<PointXYZIR> edgeFilter;
+        edgeFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+        edgeFilter.setInputCloud(rawEdges); 
+        edgeFilter.filter(*_voxelEdges);
+
+        // Downsample Patches (0.4m voxel length)
+        pcl::VoxelGrid<PointXYZIR> planeFilter;
+        planeFilter.setLeafSize(0.4f, 0.4f, 0.4f);
+        planeFilter.setInputCloud(rawPatches);
+        planeFilter.filter(*_voxelPatches);
+
+        // Build KD-Trees (used later for searching for nearest neighbours)
+        if (_voxelEdges->size() > 0) _kdtreeEdges.setInputCloud(_voxelEdges);
+        if (_voxelPatches->size() > 0) _kdtreePatches.setInputCloud(_voxelPatches);
+    }
+
+    // Find 2 neighbours for an edge point
+    bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
+        if (_voxelEdges->empty()) return false;
+        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
+    }
+
+    // Find 3 neighbours for a planar point
+    bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
+        if (_voxelPatches->empty()) return false;
+        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
+    }
+
+    const pcl::PointCloud<PointXYZIR>& getEdges() const { return *_voxelEdges; }
+    const pcl::PointCloud<PointXYZIR>& getPatches() const { return *_voxelPatches; }
+    pcl::PointCloud<PointXYZIR> getVoxels() const { return *_voxelEdges + *_voxelPatches; }
+    /**
+     * @note: ONLY for internal testing
+     */
+    pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
 
 private:
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
+    // Voxel Maps
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelEdges;
+    pcl::PointCloud<PointXYZIR>::Ptr _voxelPatches;
+    pcl::PointCloud<PointXYZIR>::Ptr _upsampledPCL;
+
+    // Search Trees
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreeEdges;
+    pcl::KdTreeFLANN<PointXYZIR> _kdtreePatches;
 };
+
+/**
+ * @note: Both map and target must be in a common frame
+ */
+void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess) {
+
+    if (map.getKeyframes().size() == 0) {return;}
+    const int maxIterations = 10;
+    const float epsilon = 1e-4;
+    const float maxDistSq = 1.0;
+
+    for (int iter = 0; iter < maxIterations; ++iter) {
+            
+        // Go over the incoming LidarFrame
+        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
+        Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
+
+        const pcl::PointCloud<PointXYZIR> transformedEdges = target.transformEdges(currentGuess);
+        const pcl::PointCloud<PointXYZIR> transformedPatches = target.transformPatches(currentGuess);
+
+        for (const auto& edge : transformedEdges) {
+            Eigen::Vector3f pi = edge.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+            if (map.findEdgeNeighbors(edge, indices, dists)) {
+                if (dists[1] > maxDistSq) continue; 
+
+                Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                if ((pj - pl).norm() < 0.1f) continue;
+                
+                // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
+                // vUnit = (pj - pl) / || pj - pl ||
+                // Jacobian = [ [vUnit]_x @ [P_i]_x     -[vUnit]_x ]
+                // b_i = [e_0]_x @ vUnit
+                Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
+                Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
+                
+                // Initialize a fixed-size 3x6 matrix
+                Eigen::Matrix<float, 3, 6> Ai;
+
+                Eigen::Matrix3f vSkew = skew(vUnit);
+                Eigen::Matrix3f pSkew = skew(pi);
+
+                // Left side: Rotation (delta_theta) -> [vUnit]_x * [pi]_x
+                Ai.leftCols<3>() = vSkew * pSkew;
+
+                // Right side: Translation (delta_t) -> -[vUnit]_x
+                Ai.rightCols<3>() = -vSkew;
+
+                H.noalias() += Ai.transpose() * Ai; 
+                g.noalias() += Ai.transpose() * bi;
+        
+            }
+        }
+
+        for (const auto& patch : transformedPatches) {
+            Eigen::Vector3f pi = patch.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+
+            if (map.findPlaneNeighbors(patch, indices, dists)) {
+                if (dists[2] > maxDistSq) continue; 
+
+                Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
+                Eigen::Vector3f pw = (map.getPatches())[indices[2]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                Eigen::Vector3f normal = (pu - pv).cross(pu - pw);
+                float normalMag = normal.norm();
+                Eigen::Vector3f unitNormal = normal / normalMag;
+
+                if (normalMag < 0.1f) continue;
+                // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
+                // unit_normal = (pu - pv) x  (pw - pv) / ||(pu - pv) x  (pw - pv)||
+                // Jacobian = [(pi x ni).T      unit_normal.T]
+                // b_i = unit_normal.T @ (pi - pv)
+
+                float bi = unitNormal.transpose().dot(pi - pv);
+                Eigen::Matrix<float, 1, 6> Ai;
+                Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
+                Ai.rightCols<3>() = unitNormal.transpose();
+
+                H.noalias() += Ai.transpose() * Ai; 
+                g.noalias() += Ai.transpose() * bi;
+            }
+        }
+
+        Eigen::Vector<float, 6> deltaTransform = H.ldlt().solve(-g);
+
+        Eigen::Isometry3f nudge = Eigen::Isometry3f::Identity();
+        float angle = deltaTransform.head<3>().norm();
+        if (angle > 1e-6) {
+            Eigen::Vector3f axis = deltaTransform.head<3>() / angle;
+            nudge.linear() = Eigen::AngleAxisf(angle, axis).toRotationMatrix();
+        } else {
+            // Fallback to identity + skew for infinitesimally small angles to avoid div by zero
+            nudge.linear() = Eigen::Matrix3f::Identity() + skew(deltaTransform.head<3>());
+        }
+            
+        nudge.translation() = deltaTransform.tail<3>();
+        currentGuess = nudge * currentGuess;
+
+        Eigen::Quaternionf q(currentGuess.linear());
+        currentGuess.linear() = q.normalized().toRotationMatrix();
+
+        if (deltaTransform.norm() < epsilon) {
+            break;
+        }
+    
+    }
+
+}
 
 class FeatureExtraction : public rclcpp::Node {
 public:
@@ -281,9 +456,12 @@ private:
 
 
     LF.extract3DFeatures();
-    Eigen::Isometry3f tf;
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
-    localMap.pushKeyframe({LF, tf.Identity()});
+    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity();
+    scanMatching(localMap, LF, tf);
+
+    // @todo: Add a check for if tf greater than some threshold. If so add it as a keyframe
+    localMap.pushKeyframe({LF, tf});
 
     // for (size_t i = 0; i < subRing->points.size(); i++) {
     //     float azimuth = std::atan2(subRing->points[i].y, subRing->points[i].x) * 180.0 / M_PI;
@@ -291,7 +469,7 @@ private:
     // }
 
     sensor_msgs::msg::PointCloud2 localMapROS;
-    pcl::toROSMsg(localMap.getPointCloud(), localMapROS);
+    pcl::toROSMsg(localMap.getVoxels(), localMapROS);
     localMapROS.header = msg->header;
     pubLocalMap_->publish(localMapROS);
 
@@ -302,7 +480,7 @@ private:
 
     // Convert PCL -> ROS message and publish
     sensor_msgs::msg::PointCloud2 outputTest;
-    pcl::toROSMsg(rings[0], outputTest);
+    pcl::toROSMsg(localMap.getUpsampled(), outputTest);
     outputTest.header = msg->header;
     pubTest_->publish(outputTest);
   }
