@@ -1,3 +1,6 @@
+#include <queue>
+#include "utils.hpp"
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -32,7 +35,7 @@ class ImuPreintegration : public rclcpp::Node
         "/imu_correct", 10, std::bind(&ImuPreintegration::imuCallback, this, std::placeholders::_1)
       );
       odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/odom_incremental", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
+        "/odom_incremental_TEMP", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
       );
 
       // imu extrinsics 
@@ -88,7 +91,8 @@ class ImuPreintegration : public rclcpp::Node
       p->biasAccCovariance = gtsam::Matrix33::Identity(3,3) * pow(accel_bias_rw_sigma_, 2);
       p->biasOmegaCovariance = gtsam::Matrix33::Identity(3,3) * pow(gyro_bias_rw_sigma_, 2);
 
-      imu_integrator_ = std::make_shared<gtsam::PreintegratedCombinedMeasurements>(p, prev_bias_);
+      imu_integrator_live_ = std::make_shared<gtsam::PreintegratedCombinedMeasurements>(p, prev_bias_);
+      imu_integrator_opt_ = std::make_shared<gtsam::PreintegratedCombinedMeasurements>(p, prev_bias_);
     }
 
   private:
@@ -101,15 +105,18 @@ class ImuPreintegration : public rclcpp::Node
       // convert imu measurement to map frame using imu extrinsics
       sensor_msgs::msg::Imu imu_meas = convertImu(*msg);
 
+      // store in buffer 4 l8er (when we need to sync with received lidar msg)
+      imu_q_.push_back(imu_meas);
+
       // integrate this imu message
       double imuTimeNow = imu_meas.header.stamp.sec + imu_meas.header.stamp.nanosec * 1e-9;
       double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTimeNow - lastImuT_imu);
       lastImuT_imu = imuTimeNow;
-      imu_integrator_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+      imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
 
       // predict odometry
-      gtsam::NavState pred = imu_integrator_->predict(prev_state_, prev_bias_);
+      gtsam::NavState pred = imu_integrator_live_->predict(prev_state_, prev_bias_);
 
       // publish odometry msg
       nav_msgs::msg::Odometry odom_msg;
@@ -168,7 +175,22 @@ class ImuPreintegration : public rclcpp::Node
       gtsam::Pose3 lidar_pose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
       // create IMU factor
-      const gtsam::PreintegratedCombinedMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements&>(*imu_integrator_);
+      // pop imu measurements from buffer until we sync timestamps with lidar msg
+      while (!imu_q_.empty()) {
+        sensor_msgs::msg::Imu imu_meas = imu_q_.front();
+        double imu_time = stamp2sec(imu_meas.header.stamp);
+
+        if (imu_time < stamp2sec(msg->header.stamp)) {
+          double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imu_time - lastImuT_opt);
+          imu_integrator_opt_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+                                            gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
+          lastImuT_opt = imu_time;
+          imu_q_.pop_front();
+        } else {
+          break;
+        }
+      }
+      const gtsam::PreintegratedCombinedMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedCombinedMeasurements&>(*imu_integrator_opt_);
       gtsam::CombinedImuFactor imu_factor(X(key-1), V(key-1), X(key), V(key), B(key-1), B(key), preint_imu);
 
       // add IMU factor to graph
@@ -180,7 +202,7 @@ class ImuPreintegration : public rclcpp::Node
 
       // add values
       // use imu preintegration prediction to initialize optimization
-      gtsam::NavState prop_state = imu_integrator_->predict(prev_state_, prev_bias_);
+      gtsam::NavState prop_state = imu_integrator_opt_->predict(prev_state_, prev_bias_);
       values_.insert(X(key), prop_state.pose());
       values_.insert(V(key), prop_state.v());
       values_.insert(B(key), prev_bias_);
@@ -196,11 +218,22 @@ class ImuPreintegration : public rclcpp::Node
       prev_bias_ = result.at<gtsam::imuBias::ConstantBias>(B(key));
       prev_state_ = gtsam::NavState(prev_pose_, prev_vel_);
 
-      // clear preintegration and graphs
-      imu_integrator_->resetIntegrationAndSetBias(prev_bias_);
+      // clear optimizer preintegration and graphs
+      imu_integrator_opt_->resetIntegrationAndSetBias(prev_bias_);
       graph_.resize(0);
       values_.clear();
 
+      // update the live preintegration and repropogate imu preintegration
+      double lastImuT_reprop = -1;
+      imu_integrator_live_->resetIntegrationAndSetBias(prev_bias_);
+      for (size_t i = 0; i<imu_q_.size(); i++) {
+        sensor_msgs::msg::Imu imu_meas = imu_q_[i];
+        double imu_time = stamp2sec(imu_meas.header.stamp);
+        double dt = (lastImuT_reprop < 0) ? (1.0 / 500.0) : (imu_time - lastImuT_reprop);
+        imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+                                            gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
+        lastImuT_reprop = imu_time;
+      }
       key++;
     }
 
@@ -247,7 +280,8 @@ class ImuPreintegration : public rclcpp::Node
     // PreintegratedImuMeasurements must be used in conjunction with a manual 
     // BetweenFactor<imuBias::ConstantBias> to approximate this and even then
     // it is an approximation. 
-    std::shared_ptr<gtsam::PreintegratedCombinedMeasurements> imu_integrator_;
+    std::shared_ptr<gtsam::PreintegratedCombinedMeasurements> imu_integrator_live_;
+    std::shared_ptr<gtsam::PreintegratedCombinedMeasurements> imu_integrator_opt_;
 
     gtsam::noiseModel::Diagonal::shared_ptr prior_pose_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr prior_vel_noise_;
@@ -261,7 +295,9 @@ class ImuPreintegration : public rclcpp::Node
 
     int key = 1;
     double lastImuT_imu = -1;
+    double lastImuT_opt = -1;
     double lastPathT_ = -1;
+    std::deque<sensor_msgs::msg::Imu> imu_q_;
 
     // noise params - take from IMU datasheet
     float accel_noise_sigma_;

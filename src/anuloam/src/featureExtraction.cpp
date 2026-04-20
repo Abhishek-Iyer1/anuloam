@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -9,6 +10,7 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Geometry>
 #include <vector>
+#include <queue>
 #include "utils.hpp"
 
 #define NUM_RINGS 16
@@ -318,8 +320,8 @@ private:
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess) {
 
     if (map.getKeyframes().size() == 0) {return;}
-    const int maxIterations = 10;
-    const float epsilon = 1e-4;
+    const int maxIterations = 50;
+    const float epsilon = 1e-5;
     const float maxDistSq = 1.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
@@ -342,7 +344,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
 
                 // Verification: Line segment must have non-zero length
-                if ((pj - pl).norm() < 0.1f) continue;
+                if ((pj - pl).norm() < 0.5f) continue;
                 
                 // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
                 // vUnit = (pj - pl) / || pj - pl ||
@@ -386,7 +388,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 float normalMag = normal.norm();
                 Eigen::Vector3f unitNormal = normal / normalMag;
 
-                if (normalMag < 0.1f) continue;
+                if (normalMag < 0.5f) continue;
                 // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
                 // unit_normal = (pu - pv) x  (pw - pv) / ||(pu - pv) x  (pw - pv)||
                 // Jacobian = [(pi x ni).T      unit_normal.T]
@@ -430,9 +432,12 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
 class FeatureExtraction : public rclcpp::Node {
 public:
-  FeatureExtraction() : Node("feature_extraction"), localMap(50) {
+  FeatureExtraction() : Node("feature_extraction"), localMap(25) {
     // TODO: check what QoS profile to follow here
-    sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+    imu_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        "/odom", 10, 
+        std::bind(&FeatureExtraction::imuCallback, this, std::placeholders::_1));
+    lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "/points_raw", 10,
         std::bind(&FeatureExtraction::pointCloudCallback, this, std::placeholders::_1));
 
@@ -443,6 +448,10 @@ public:
   }
 
 private:
+  void imuCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    imu_q_.push_back(*msg);
+  }
+
   void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     pcl::PointCloud<PointXYZIR>::Ptr cloud(new pcl::PointCloud<PointXYZIR>);
     pcl::fromROSMsg(*msg, *cloud);
@@ -459,7 +468,25 @@ private:
     
     LF.extract3DFeatures();
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
-    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity(); // TODO replace with IMU estimate
+    double cloud_time = stamp2sec(msg->header.stamp);
+
+    // get imu odometry estimate that matches with lidar measurement time
+    nav_msgs::msg::Odometry imu_odo_meas;
+    // TODO manage q with lock
+    while (!imu_q_.empty()) {
+        imu_odo_meas = imu_q_.front();
+        double imu_time = stamp2sec(imu_odo_meas.header.stamp);
+        if (imu_time > cloud_time) {
+            break;
+        }
+        imu_q_.pop_front();
+    }
+    // initialize scan matching with this tf
+    const auto& p = imu_odo_meas.pose.pose.position;
+    const auto& o = imu_odo_meas.pose.pose.orientation;
+    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity();
+    // tf.translate(Eigen::Vector3f(p.x, p.y, p.z));
+    // tf.rotate(Eigen::Quaternionf(o.w, o.x, o.y, o.z));
     scanMatching(localMap, LF, tf);
 
     // @todo: Add a check for if tf greater than some threshold. If so add it as a keyframe
@@ -486,29 +513,36 @@ private:
     odom_msg.pose.pose.orientation.w = q.w();
     pub_odom_inc_->publish(odom_msg);
 
+    // visualize local map points
     sensor_msgs::msg::PointCloud2 localMapROS;
     pcl::toROSMsg(localMap.getVoxels(), localMapROS);
     localMapROS.header = msg->header;
+    localMapROS.header.frame_id = "map";
     pubLocalMap_->publish(localMapROS);
 
+    // visualize features
     sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(features, output);
     output.header = msg->header;
+    output.header.frame_id = "map";
     pub_->publish(output);
 
-    // Convert PCL -> ROS message and publish
+    // Convert PCL -> ROS message and publish IGNORE
     sensor_msgs::msg::PointCloud2 outputTest;
     pcl::toROSMsg(localMap.getUpsampled(), outputTest);
     outputTest.header = msg->header;
     pubTest_->publish(outputTest);
   }
 
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr imu_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_inc_;
   LocalMap localMap;
+
+  std::deque<nav_msgs::msg::Odometry> imu_q_;
 };
 
 
