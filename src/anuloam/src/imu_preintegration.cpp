@@ -13,6 +13,8 @@
 #include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/nonlinear/ISAM2.h>
 
+#include <Eigen/Geometry>
+
 using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
@@ -33,6 +35,10 @@ class ImuPreintegration : public rclcpp::Node
         "/odom_incremental", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
       );
 
+      // imu extrinsics 
+      // TODO make params?
+      extRot = (Eigen::Matrix3d() << 0, 1.f, 0, -1.f, 0, 0, 0, 0, 1.f).finished();
+
       // params
       declare_parameter("accel_noise_sigma", 9e-4);
       get_parameter("accel_noise_sigma", accel_noise_sigma_);
@@ -46,11 +52,13 @@ class ImuPreintegration : public rclcpp::Node
       // initial values
       prev_pose_ = gtsam::Pose3::Identity();
       prev_vel_ = gtsam::Vector3::Zero();
+      prev_state_ = gtsam::NavState(prev_pose_, prev_vel_);
       prev_bias_ = gtsam::imuBias::ConstantBias(); // zeros
       // from LIOSAM, make params?
       prior_pose_noise_ = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished());
       prior_vel_noise_ = gtsam::noiseModel::Isotropic::Sigma(3, 1e-2); // wtf this is really high?
       prior_bias_noise_ = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3);
+      lidar_noise_ = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished());
 
       // init factor graph
       gtsam::ISAM2Params isam_params;
@@ -90,8 +98,8 @@ class ImuPreintegration : public rclcpp::Node
         msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z,
         msg->angular_velocity.x,    msg->angular_velocity.y,    msg->angular_velocity.z);
 
-      // convert imu measurement to ego frame using imu extrinsics
-      sensor_msgs::msg::Imu imu_meas = *msg;
+      // convert imu measurement to map frame using imu extrinsics
+      sensor_msgs::msg::Imu imu_meas = convertImu(*msg);
 
       // integrate this imu message
       double imuTimeNow = imu_meas.header.stamp.sec + imu_meas.header.stamp.nanosec * 1e-9;
@@ -107,7 +115,7 @@ class ImuPreintegration : public rclcpp::Node
       nav_msgs::msg::Odometry odom_msg;
       odom_msg.header.stamp = imu_meas.header.stamp;
       odom_msg.header.frame_id = "map"; // temp?
-      odom_msg.child_frame_id = "imu";
+      odom_msg.child_frame_id = "velodyne";
 
       odom_msg.pose.pose.position.x = pred.position().x();
       odom_msg.pose.pose.position.y = pred.position().y();
@@ -167,7 +175,7 @@ class ImuPreintegration : public rclcpp::Node
       graph_.add(imu_factor);
 
       // create and add lidar factor
-      gtsam::PriorFactor<gtsam::Pose3> lidar_factor(X(key), lidar_pose); // prior factor because we have value = pose
+      gtsam::PriorFactor<gtsam::Pose3> lidar_factor(X(key), lidar_pose, lidar_noise_); // prior factor because we have absolute pose, value = pose
       graph_.add(lidar_factor);
 
       // add values
@@ -196,6 +204,30 @@ class ImuPreintegration : public rclcpp::Node
       key++;
     }
 
+    sensor_msgs::msg::Imu convertImu(sensor_msgs::msg::Imu imu_in) {
+      sensor_msgs::msg::Imu imu_out = imu_in;
+      Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
+      acc = extRot * acc;
+      imu_out.linear_acceleration.x = acc.x();
+      imu_out.linear_acceleration.y = acc.y();
+      imu_out.linear_acceleration.z = acc.z();
+
+      Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
+      gyr = extRot * gyr;
+      imu_out.angular_velocity.x = gyr.x();
+      imu_out.angular_velocity.y = gyr.y();
+      imu_out.angular_velocity.z = gyr.z();
+
+      Eigen::Quaterniond quat(imu_in.orientation.w, imu_in.orientation.x, imu_in.orientation.y, imu_in.orientation.z);
+      quat = Eigen::Quaterniond(extRot) * quat;
+      imu_out.orientation.w = quat.w();
+      imu_out.orientation.x = quat.x();
+      imu_out.orientation.y = quat.y();
+      imu_out.orientation.z = quat.z();
+
+      return imu_out;
+    }
+
     // ROS pub and sub
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
@@ -220,6 +252,7 @@ class ImuPreintegration : public rclcpp::Node
     gtsam::noiseModel::Diagonal::shared_ptr prior_pose_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr prior_vel_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr prior_bias_noise_;
+    gtsam::noiseModel::Diagonal::shared_ptr lidar_noise_;
 
     gtsam::Pose3 prev_pose_;
     gtsam::Vector3 prev_vel_;
@@ -235,6 +268,9 @@ class ImuPreintegration : public rclcpp::Node
     float gyro_noise_sigma_;
     float accel_bias_rw_sigma_;
     float gyro_bias_rw_sigma_;
+
+    // imu extrinsics
+    Eigen::Matrix3d extRot;
 };
 
 int main(int argc, char ** argv)

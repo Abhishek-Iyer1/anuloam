@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/common/transforms.h>
@@ -438,6 +439,7 @@ public:
     pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_processed", 10);
     pubLocalMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_local_map", 10);
     pubTest_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
+    pub_odom_inc_ = create_publisher<nav_msgs::msg::Odometry>("/odom_incremental", 10);
   }
 
 private:
@@ -457,7 +459,7 @@ private:
     
     LF.extract3DFeatures();
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
-    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity();
+    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity(); // TODO replace with IMU estimate
     scanMatching(localMap, LF, tf);
 
     // @todo: Add a check for if tf greater than some threshold. If so add it as a keyframe
@@ -467,6 +469,22 @@ private:
     //     float azimuth = std::atan2(subRing->points[i].y, subRing->points[i].x) * 180.0 / M_PI;
     //     RCLCPP_INFO(this->get_logger(), "Point %zu: azimuth = %.2f°", i, azimuth);
     // }
+
+    // publish this tf as an odometry msg 
+    nav_msgs::msg::Odometry odom_msg;
+    odom_msg.header.stamp = msg->header.stamp;
+    odom_msg.header.frame_id = "map";
+    odom_msg.child_frame_id = "velodyne";
+    
+    odom_msg.pose.pose.position.x = tf.translation().x();
+    odom_msg.pose.pose.position.y = tf.translation().y();
+    odom_msg.pose.pose.position.z = tf.translation().z();
+    Eigen::Quaternionf q(tf.rotation());
+    odom_msg.pose.pose.orientation.x = q.x();
+    odom_msg.pose.pose.orientation.y = q.y();
+    odom_msg.pose.pose.orientation.z = q.z();
+    odom_msg.pose.pose.orientation.w = q.w();
+    pub_odom_inc_->publish(odom_msg);
 
     sensor_msgs::msg::PointCloud2 localMapROS;
     pcl::toROSMsg(localMap.getVoxels(), localMapROS);
@@ -489,6 +507,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_inc_;
   LocalMap localMap;
 };
 
