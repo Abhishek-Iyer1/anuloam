@@ -7,6 +7,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/common/transforms.h>
+#include <pcl/registration/icp.h>
 #include <pcl/kdtree/impl/kdtree_flann.hpp>
 #include <pcl/search/impl/kdtree.hpp>
 #include <pcl/impl/pcl_base.hpp>
@@ -26,6 +28,26 @@
 
 #include <Eigen/Geometry>
 
+#include "utils.hpp"
+
+#define NUM_RINGS 16
+
+struct PointXYZIR {
+    PCL_ADD_POINT4D;
+    float intensity;
+    std::uint16_t ring;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIR,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (std::uint16_t, ring, ring)
+)
+
+
 namespace {
 
 // gtsam::Pose3 uses double; scan matching uses float transforms
@@ -37,10 +59,10 @@ gtsam::Pose3 eigenIsometryToPose3(const Eigen::Isometry3f& T) {
 }
 
 Eigen::Isometry3f pose3ToEigenIsometry(const gtsam::Pose3& pose) {
-    return Eigen::Isometry3f(
-        pose.rotation().toRotationMatrix(),
-        Eigen::Vector3f(pose.translation().x(), pose.translation().y(), pose.translation().z())
-    );
+    Eigen::Isometry3f T = Eigen::Isometry3f::Identity();
+    T.linear() = pose.rotation().matrix().cast<float>();
+    T.translation() = pose.translation().cast<float>();
+    return T;
 }
 
 }  // namespace
@@ -92,7 +114,7 @@ public:
 
         for (int j = setStart; j <= setEnd; j++) {
             if (j == 0) continue;
-            size_t wrapped = (ind + j + scanSize) % scanSize;
+            size_t wrapped = static_cast<size_t>((static_cast<int>(ind) + j + static_cast<int>(scanSize)) % static_cast<int>(scanSize));
             sumX += ring[ind].x - ring[wrapped].x;
             sumY += ring[ind].y - ring[wrapped].y;
             sumZ += ring[ind].z - ring[wrapped].z;
@@ -127,8 +149,8 @@ public:
 
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
-            size_t currentFeatures = 0;
-            size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
+            // size_t currentFeatures = 0;
+            // size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
 
             // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
 
@@ -441,7 +463,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
 class GlobalMapNode : public rclcpp::Node {
 public:
-    GlobalMapNode() : Node("global_map") {
+    GlobalMapNode() : Node("global_map"), localMap(50){
         // Subs and pubs
         subPoints_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/points_raw",
@@ -493,7 +515,7 @@ private:
 
     // Factor graph variables
     int keyFrameID = 0;
-    gtsam::Pose3 currentPoseEstimate = gtsam::Pose3::identity();
+    gtsam::Pose3 currentPoseEstimate = gtsam::Pose3::Identity();
 
     // Noise models (Covariances)
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
@@ -520,10 +542,7 @@ private:
         pcl::fromROSMsg(*msg, *currentCloud);
 
         LidarFrame LF = LidarFrame(*msg);
-        pcl::PointCloud<PointXYZIR> subCloud = LF.getPCL();
-        LF.extractRings(subCloud);
         LF.extract3DFeatures();
-        pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
 
         // @todo: Perform Scan Matching
         Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
@@ -538,8 +557,8 @@ private:
             const auto& [lastLidarFrame, lastTf] = keyframes.back();
             relative_pose = lastTf.inverse() * currentTf;
             Eigen::AngleAxisf aa(relative_pose.rotation());
-            isKeyFrame = (relative_pose.translation().norm() < keyframeTranslationThresh_ && aa.angle() < keyframeRotationThresh_);
-            if (isKeyFrame) {
+            isKeyFrame = (relative_pose.translation().norm() > keyframeTranslationThresh_ || aa.angle() > keyframeRotationThresh_);
+            if (!isKeyFrame) {
                 return;
             }
         }
@@ -568,6 +587,9 @@ private:
 
         // Add logging
         RCLCPP_INFO(this->get_logger(), "Received %zu points", currentCloud->points.size());
+
+        // Add the current keyframe to the local map
+        localMap.pushKeyframe({LF, currentTf});
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -589,10 +611,10 @@ private:
         if (keyFrameID == 0) {
             // Add a PriorFactor to anchor the graph at the origin.
             gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(
-                currentKey, gtsam::Pose3::identity(), prior_noise_)
+                currentKey, gtsam::Pose3::Identity(), prior_noise_)
             );
             // Add the initial guess (Identity)
-            initialEstimate_.insert(currentKey, gtsam::Pose3::identity());
+            initialEstimate_.insert(currentKey, gtsam::Pose3::Identity());
 
             keyFrameID++;
             return;
