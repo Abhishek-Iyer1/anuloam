@@ -5,3 +5,4 @@ log/
 
 # rosbag data — too large for version control
 data/
+.vscode/
