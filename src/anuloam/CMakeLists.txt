@@ -24,13 +24,17 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(OpenMP REQUIRED)
 
 add_executable(imu_preintegration src/imu_preintegration.cpp)
 ament_target_dependencies(imu_preintegration rclcpp sensor_msgs nav_msgs geometry_msgs tf2_ros)
 target_link_libraries(imu_preintegration gtsam)
 add_executable(feature_extraction src/featureExtraction.cpp)
 ament_target_dependencies(feature_extraction rclcpp sensor_msgs pcl_ros pcl_conversions)
-target_link_libraries(feature_extraction ${PCL_LIBRARIES})
+target_link_libraries(feature_extraction 
+    ${PCL_LIBRARIES} 
+    OpenMP::OpenMP_CXX
+)
 
 # Explicitly control RPATH so conda's lib directory is never embedded in the
 # installed binary. Without this, CMake auto-appends any transitive dependency
