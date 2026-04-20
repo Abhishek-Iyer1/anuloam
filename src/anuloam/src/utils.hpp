@@ -1,5 +1,6 @@
 #include <vector>
 #include <cassert>
+#include <Eigen/Geometry>
 
 template <typename T>
 class CircularBuffer {
@@ -40,3 +41,11 @@ private:
     bool _isFull;
     size_t _maxSize;
 };
+
+inline Eigen::Matrix3f skew(const Eigen::Vector3f& v) {
+    Eigen::Matrix3f m;
+    m <<    0, -v(2),  v(1),
+         v(2),     0, -v(0),
+        -v(1),  v(0),     0;
+    return m;
+}

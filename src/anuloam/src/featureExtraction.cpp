@@ -238,12 +238,12 @@ public:
         _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
     {}
     
-    CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> getKeyframes() { return _keyframes; }
+    const CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>>& getKeyframes() const { return _keyframes; }
     
     /**
      * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
      */
-    void pushKeyframe(std::pair<LidarFrame, Eigen::Isometry3f> keyframe) { 
+    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) { 
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
@@ -280,19 +280,24 @@ public:
     }
 
     // Find 2 neighbours for an edge point
-    bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) {
+    bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelEdges->empty()) return false;
         return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
     }
 
     // Find 3 neighbours for a planar point
-    bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) {
+    bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelPatches->empty()) return false;
         return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
     }
 
-    pcl::PointCloud<PointXYZIR> getVoxels() { return *_voxelEdges + *_voxelPatches; }
-    pcl::PointCloud<PointXYZIR> getUpsampled() { return *_upsampledPCL; }
+    const pcl::PointCloud<PointXYZIR>& getEdges() const { return *_voxelEdges; }
+    const pcl::PointCloud<PointXYZIR>& getPatches() const { return *_voxelPatches; }
+    pcl::PointCloud<PointXYZIR> getVoxels() const { return *_voxelEdges + *_voxelPatches; }
+    /**
+     * @note: ONLY for internal testing
+     */
+    pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
 
 private:
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
@@ -305,6 +310,122 @@ private:
     pcl::KdTreeFLANN<PointXYZIR> _kdtreeEdges;
     pcl::KdTreeFLANN<PointXYZIR> _kdtreePatches;
 };
+
+/**
+ * @note: Both map and target must be in a common frame
+ */
+void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess) {
+
+    if (map.getKeyframes().size() == 0) {return;}
+    const int maxIterations = 10;
+    const float epsilon = 1e-4;
+    const float maxDistSq = 1.0;
+
+    for (int iter = 0; iter < maxIterations; ++iter) {
+            
+        // Go over the incoming LidarFrame
+        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
+        Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
+
+        const pcl::PointCloud<PointXYZIR> transformedEdges = target.transformEdges(currentGuess);
+        const pcl::PointCloud<PointXYZIR> transformedPatches = target.transformPatches(currentGuess);
+
+        for (const auto& edge : transformedEdges) {
+            Eigen::Vector3f pi = edge.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+            if (map.findEdgeNeighbors(edge, indices, dists)) {
+                if (dists[1] > maxDistSq) continue; 
+
+                Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                if ((pj - pl).norm() < 0.1f) continue;
+                
+                // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
+                // vUnit = (pj - pl) / || pj - pl ||
+                // Jacobian = [ [vUnit]_x @ [P_i]_x     -[vUnit]_x ]
+                // b_i = [e_0]_x @ vUnit
+                Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
+                Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
+                
+                // Initialize a fixed-size 3x6 matrix
+                Eigen::Matrix<float, 3, 6> Ai;
+
+                Eigen::Matrix3f vSkew = skew(vUnit);
+                Eigen::Matrix3f pSkew = skew(pi);
+
+                // Left side: Rotation (delta_theta) -> [vUnit]_x * [pi]_x
+                Ai.leftCols<3>() = vSkew * pSkew;
+
+                // Right side: Translation (delta_t) -> -[vUnit]_x
+                Ai.rightCols<3>() = -vSkew;
+
+                H.noalias() += Ai.transpose() * Ai; 
+                g.noalias() += Ai.transpose() * bi;
+        
+            }
+        }
+
+        for (const auto& patch : transformedPatches) {
+            Eigen::Vector3f pi = patch.getVector3fMap();
+            std::vector<int> indices;
+            std::vector<float> dists;
+
+            if (map.findPlaneNeighbors(patch, indices, dists)) {
+                if (dists[2] > maxDistSq) continue; 
+
+                Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
+                Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
+                Eigen::Vector3f pw = (map.getPatches())[indices[2]].getVector3fMap();
+
+                // Verification: Line segment must have non-zero length
+                Eigen::Vector3f normal = (pu - pv).cross(pu - pw);
+                float normalMag = normal.norm();
+                Eigen::Vector3f unitNormal = normal / normalMag;
+
+                if (normalMag < 0.1f) continue;
+                // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
+                // unit_normal = (pu - pv) x  (pw - pv) / ||(pu - pv) x  (pw - pv)||
+                // Jacobian = [(pi x ni).T      unit_normal.T]
+                // b_i = unit_normal.T @ (pi - pv)
+
+                float bi = unitNormal.transpose().dot(pi - pv);
+                Eigen::Matrix<float, 1, 6> Ai;
+                Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
+                Ai.rightCols<3>() = unitNormal.transpose();
+
+                H.noalias() += Ai.transpose() * Ai; 
+                g.noalias() += Ai.transpose() * bi;
+            }
+        }
+
+        Eigen::Vector<float, 6> deltaTransform = H.ldlt().solve(-g);
+
+        Eigen::Isometry3f nudge = Eigen::Isometry3f::Identity();
+        float angle = deltaTransform.head<3>().norm();
+        if (angle > 1e-6) {
+            Eigen::Vector3f axis = deltaTransform.head<3>() / angle;
+            nudge.linear() = Eigen::AngleAxisf(angle, axis).toRotationMatrix();
+        } else {
+            // Fallback to identity + skew for infinitesimally small angles to avoid div by zero
+            nudge.linear() = Eigen::Matrix3f::Identity() + skew(deltaTransform.head<3>());
+        }
+            
+        nudge.translation() = deltaTransform.tail<3>();
+        currentGuess = nudge * currentGuess;
+
+        Eigen::Quaternionf q(currentGuess.linear());
+        currentGuess.linear() = q.normalized().toRotationMatrix();
+
+        if (deltaTransform.norm() < epsilon) {
+            break;
+        }
+    
+    }
+
+}
 
 class FeatureExtraction : public rclcpp::Node {
 public:
@@ -335,9 +456,12 @@ private:
 
     
     LF.extract3DFeatures();
-    Eigen::Isometry3f tf;
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
-    localMap.pushKeyframe({LF, Eigen::Isometry3f::Identity()});
+    Eigen::Isometry3f tf = Eigen::Isometry3f::Identity();
+    scanMatching(localMap, LF, tf);
+
+    // @todo: Add a check for if tf greater than some threshold. If so add it as a keyframe
+    localMap.pushKeyframe({LF, tf});
 
     // for (size_t i = 0; i < subRing->points.size(); i++) {
     //     float azimuth = std::atan2(subRing->points[i].y, subRing->points[i].x) * 180.0 / M_PI;
