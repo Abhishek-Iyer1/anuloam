@@ -43,7 +43,7 @@ target_link_libraries(feature_extraction
 # causing GLIBCXX version-not-found errors at runtime.
 foreach(target imu_preintegration feature_extraction)
   set_target_properties(${target} PROPERTIES
-    INSTALL_RPATH "/opt/ros/humble/lib"
+    INSTALL_RPATH "/opt/ros/jazzy/lib"
     INSTALL_RPATH_USE_LINK_PATH FALSE
     BUILD_WITH_INSTALL_RPATH TRUE
   )
