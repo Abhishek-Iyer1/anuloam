@@ -455,8 +455,8 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             }
         }
 
-        std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n",
-                    iter, edgeCount, edgeLoss, patchCount, patchLoss, (edgeLoss + patchLoss));
+        // std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n",
+        //             iter, edgeCount, edgeLoss, patchCount, patchLoss, (edgeLoss + patchLoss));
 
         if (iterCallback) {
             pcl::PointCloud<PointXYZIR> currentAligned;
@@ -489,7 +489,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         currentGuess.linear() = q.normalized().toRotationMatrix();
 
         if (deltaTransform.norm() < epsilon) {
-            std::printf("Converged at iteration %d!\n", iter);
+            // std::printf("Converged at iteration %d!\n", iter);
             break;
         }
 
@@ -529,6 +529,7 @@ public:
             10
         );
         pubTest_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
+        pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
 
 
         // Noise models (Covariances)
@@ -555,6 +556,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubGlobalOdom_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMapDebug_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubGlobalMap_;
 
     // LiDAR processing
     LocalMap localMap;
@@ -580,6 +582,7 @@ private:
 
     // Keyframe variables
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloudKeyPoses3D_{new pcl::PointCloud<pcl::PointXYZ>()};
+    std::vector<gtsam::Pose3> cloudKeyPoses6D_;
     std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> cloudKeyframes_;
     pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
 
@@ -668,24 +671,28 @@ private:
 
         publishLocalMap(msg->header.stamp);
 
-        // // Update Factor Graph with the pose
-        // updateGraph(eigenIsometryToPose3(delta));
+        // Update Factor Graph with the pose
+        updateGraph(eigenIsometryToPose3(delta));
 
         // // Detect Loop Closure
-        // detectLoopClosure(currentCloud);
+        detectLoopClosure(currentCloud);
 
-        // // Optimize the factor graph
+        // Optimize the factor graph
         // isam_->update(gtSAMgraph_, initialEstimate_);
-        // isam_->update(); // Often called twice to ensure convergence
+        // isam_->update();
 
-        // // Clear graph and estimates for next iteration
+        // Clear graph and estimates for next iteration
         // gtSAMgraph_.resize(0);
         // initialEstimate_.clear();
 
-        // // Publish global odometry
+        // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
         // gtsam::Values currentEstimate = isam_->calculateEstimate();
-        // Eigen::Isometry3f CurrentGlobalTf = pose3ToEigenIsometry(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', keyFrameID - 1)));
-        // publishGlobalOdometry(CurrentGlobalTf, msg->header.stamp);
+        // cloudKeyPoses6D_.clear();
+        // for (int i = 0; i < keyFrameID; ++i) {
+        //     cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
+        // }
+
+        publishGlobalMap(msg->header.stamp);
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -693,10 +700,9 @@ private:
     }
 
     void updateGraph(const gtsam::Pose3& odomStep) {
-        // @todo: Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
-        // @todo: Insert the initial guess into initialEstimate_
         gtsam::Symbol currentKey('X', keyFrameID);
 
+        // Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
         if (keyFrameID == 0) {
             // Add a PriorFactor to anchor the graph at the origin.
             gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(
@@ -709,6 +715,7 @@ private:
             return;
         }
 
+        // Insert the initial guess into initialEstimate_
         gtsam::Symbol previousKey('X', keyFrameID - 1);
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(previousKey, currentKey, odomStep, odom_noise_));
         currentPoseEstimate = currentPoseEstimate.compose(odomStep);
@@ -727,7 +734,11 @@ private:
         currentPose3D.y = currentPoseEstimate.translation().y();
         currentPose3D.z = currentPoseEstimate.translation().z();
         cloudKeyPoses3D_->push_back(currentPose3D);
+        cloudKeyPoses6D_.push_back(currentPoseEstimate);
         cloudKeyframes_.push_back(currentCloud);
+
+        // Add return to visualize global map without loop closure
+        return;
 
         int currentID = cloudKeyPoses3D_->size() - 1;
 
@@ -811,6 +822,37 @@ private:
         cloudMsg.header.stamp = timestamp;
         cloudMsg.header.frame_id = "map";
         pubLocalMapDebug_->publish(cloudMsg);
+    }
+
+    void publishGlobalMap(const rclcpp::Time& timestamp) {
+        if (cloudKeyframes_.empty()) return;
+
+        pcl::VoxelGrid<pcl::PointXYZI> perFrameFilter;
+        perFrameFilter.setLeafSize(0.2f, 0.2f, 0.2f);
+
+        pcl::PointCloud<pcl::PointXYZI> globalCloud;
+        for (size_t i = 0; i < cloudKeyframes_.size(); ++i) {
+            pcl::PointCloud<pcl::PointXYZI> downsampled;
+            perFrameFilter.setInputCloud(cloudKeyframes_[i]);
+            perFrameFilter.filter(downsampled);
+
+            pcl::PointCloud<pcl::PointXYZI> transformed;
+            Eigen::Isometry3f pose = pose3ToEigenIsometry(cloudKeyPoses6D_[i]);
+            pcl::transformPointCloud(downsampled, transformed, pose.matrix());
+            globalCloud += transformed;
+        }
+
+        pcl::PointCloud<pcl::PointXYZI> filtered;
+        pcl::VoxelGrid<pcl::PointXYZI> vf;
+        vf.setLeafSize(0.4f, 0.4f, 0.4f);
+        vf.setInputCloud(globalCloud.makeShared());
+        vf.filter(filtered);
+
+        sensor_msgs::msg::PointCloud2 cloudMsg;
+        pcl::toROSMsg(filtered, cloudMsg);
+        cloudMsg.header.stamp = timestamp;
+        cloudMsg.header.frame_id = "map";
+        pubGlobalMap_->publish(cloudMsg);
     }
 
     void publishIncrementalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
