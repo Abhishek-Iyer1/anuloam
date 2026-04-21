@@ -1,6 +1,7 @@
 #include <vector>
 #include <cassert>
 #include <Eigen/Geometry>
+#include <builtin_interfaces/msg/time.hpp>
 
 template <typename T>
 class CircularBuffer {
@@ -56,4 +57,8 @@ inline Eigen::Matrix3f skew(const Eigen::Vector3f& v) {
          v(2),     0, -v(0),
         -v(1),  v(0),     0;
     return m;
+}
+
+inline double stamp2sec(const builtin_interfaces::msg::Time& stamp) {
+    return stamp.sec + stamp.nanosec * 1e-9;
 }

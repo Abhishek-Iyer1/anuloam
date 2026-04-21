@@ -27,9 +27,9 @@ find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
 
 add_executable(feature_extraction src/featureExtraction.cpp)
-ament_target_dependencies(feature_extraction rclcpp sensor_msgs pcl_ros pcl_conversions)
-target_link_libraries(feature_extraction
-    ${PCL_LIBRARIES}
+ament_target_dependencies(feature_extraction rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
+target_link_libraries(feature_extraction 
+    ${PCL_LIBRARIES} 
     OpenMP::OpenMP_CXX
 )
 
@@ -42,11 +42,13 @@ target_link_libraries(imu_preintegration gtsam)
 # path (e.g. miniconda3/lib via spdlog/fmt) to RUNPATH, which makes the
 # dynamic linker pick up conda's old libstdc++ instead of the system one,
 # causing GLIBCXX version-not-found errors at runtime.
-set_target_properties(imu_preintegration PROPERTIES
-  INSTALL_RPATH "/opt/ros/jazzy/lib"
-  INSTALL_RPATH_USE_LINK_PATH FALSE
-  BUILD_WITH_INSTALL_RPATH TRUE
-)
+foreach(target imu_preintegration feature_extraction)
+  set_target_properties(${target} PROPERTIES
+    INSTALL_RPATH "/opt/ros/jazzy/lib"
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+endforeach()
 
 install(
   TARGETS feature_extraction imu_preintegration
