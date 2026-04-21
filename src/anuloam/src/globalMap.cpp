@@ -666,6 +666,8 @@ private:
         localMap.pushKeyframe({LF, currentTf});
         RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
+        publishLocalMap(msg->header.stamp);
+
         // // Update Factor Graph with the pose
         // updateGraph(eigenIsometryToPose3(delta));
 
@@ -684,8 +686,6 @@ private:
         // gtsam::Values currentEstimate = isam_->calculateEstimate();
         // Eigen::Isometry3f CurrentGlobalTf = pose3ToEigenIsometry(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', keyFrameID - 1)));
         // publishGlobalOdometry(CurrentGlobalTf, msg->header.stamp);
-
-        // publishLocalMap(msg->header.stamp);
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -806,18 +806,8 @@ private:
     }
 
     void publishLocalMap(const rclcpp::Time& timestamp) {
-        const auto& keyframes = localMap.getKeyframes();
-        pcl::PointCloud<PointXYZIR> combinedCloud;
-        for (size_t i = 0; i < keyframes.size(); ++i) {
-            const auto& [frame, tf] = keyframes[i];
-            pcl::PointCloud<PointXYZIR> transformedEdges, transformedPatches;
-            pcl::transformPointCloud(frame.getEdges(), transformedEdges, tf.matrix());
-            pcl::transformPointCloud(frame.getPatches(), transformedPatches, tf.matrix());
-            combinedCloud += transformedEdges;
-            combinedCloud += transformedPatches;
-        }
         sensor_msgs::msg::PointCloud2 cloudMsg;
-        pcl::toROSMsg(combinedCloud, cloudMsg);
+        pcl::toROSMsg(localMap.getVoxels(), cloudMsg);
         cloudMsg.header.stamp = timestamp;
         cloudMsg.header.frame_id = "map";
         pubLocalMapDebug_->publish(cloudMsg);
@@ -827,7 +817,7 @@ private:
         nav_msgs::msg::Odometry odomMsg;
         odomMsg.header.stamp = timestamp;
         odomMsg.header.frame_id = "map";
-        odomMsg.child_frame_id = "lidar";
+        odomMsg.child_frame_id = "velodyne";
         odomMsg.pose.pose.position.x = currentTf.translation().x();
         odomMsg.pose.pose.position.y = currentTf.translation().y();
         odomMsg.pose.pose.position.z = currentTf.translation().z();
