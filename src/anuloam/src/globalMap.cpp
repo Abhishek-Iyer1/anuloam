@@ -259,8 +259,11 @@ private:
     float maxRange = 20.0;
 };
 
-
-class LocalMap {
+/**
+ * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud.
+ * Challenge is the design of removal of earlier pointclouds
+ */
+ class LocalMap {
 public:
 
     LocalMap(size_t size) :
@@ -310,17 +313,17 @@ public:
         if (_voxelEdges->size() > 0) _kdtreeEdges.setInputCloud(_voxelEdges);
         if (_voxelPatches->size() > 0) _kdtreePatches.setInputCloud(_voxelPatches);
     }
-    
+
     // Find 2 neighbours for an edge point
     bool findEdgeNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelEdges->empty()) return false;
-        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) == 2;
+        return _kdtreeEdges.nearestKSearch(pi, 2, indices, dists) > 0;
     }
 
     // Find 3 neighbours for a planar point
     bool findPlaneNeighbors(const PointXYZIR& pi, std::vector<int>& indices, std::vector<float>& dists) const {
         if (_voxelPatches->empty()) return false;
-        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) == 3;
+        return _kdtreePatches.nearestKSearch(pi, 3, indices, dists) > 0;
     }
 
     const pcl::PointCloud<PointXYZIR>& getEdges() const { return *_voxelEdges; }
@@ -329,7 +332,7 @@ public:
     /**
         * @note: ONLY for internal testing
         */
-    const pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
+    pcl::PointCloud<PointXYZIR>& getUpsampled() const { return *_upsampledPCL; }
 
 private:
     CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>> _keyframes;
@@ -343,14 +346,19 @@ private:
     pcl::KdTreeFLANN<PointXYZIR> _kdtreePatches;
 };
 
+
 /**
-    * @note: Both map and target must be in a common frame
-    */
-void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess) {
+ * @note: Both map and target must be in a common frame
+ */
+void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
+                  std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
 
     if (map.getKeyframes().size() == 0) {return;}
-    const int maxIterations = 10;
-    const float epsilon = 1e-4;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    const int maxIterations = 50;
+    const float epsilon = 1e-5;
     const float maxDistSq = 1.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
@@ -358,6 +366,11 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         // Go over the incoming LidarFrame
         Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
         Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
+
+        float edgeLoss = 0.0f;
+        float patchLoss = 0.0f;
+        int edgeCount = 0;
+        int patchCount = 0;
 
         const pcl::PointCloud<PointXYZIR> transformedEdges = target.transformEdges(currentGuess);
         const pcl::PointCloud<PointXYZIR> transformedPatches = target.transformPatches(currentGuess);
@@ -373,7 +386,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
 
                 // Verification: Line segment must have non-zero length
-                if ((pj - pl).norm() < 0.1f) continue;
+                if ((pj - pl).norm() < 1e-3f) continue;
 
                 // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
                 // vUnit = (pj - pl) / || pj - pl ||
@@ -381,6 +394,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // b_i = [e_0]_x @ vUnit
                 Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
                 Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
+
+                edgeLoss += bi.squaredNorm();
+                edgeCount++;
 
                 // Initialize a fixed-size 3x6 matrix
                 Eigen::Matrix<float, 3, 6> Ai;
@@ -415,15 +431,21 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // Verification: Line segment must have non-zero length
                 Eigen::Vector3f normal = (pu - pv).cross(pu - pw);
                 float normalMag = normal.norm();
+
+                if (normalMag < 1e-3f) continue;
+
                 Eigen::Vector3f unitNormal = normal / normalMag;
 
-                if (normalMag < 0.1f) continue;
                 // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
                 // unit_normal = (pu - pv) x  (pw - pv) / ||(pu - pv) x  (pw - pv)||
                 // Jacobian = [(pi x ni).T      unit_normal.T]
                 // b_i = unit_normal.T @ (pi - pv)
 
                 float bi = unitNormal.transpose().dot(pi - pv);
+
+                patchLoss += (bi * bi);
+                patchCount++;
+
                 Eigen::Matrix<float, 1, 6> Ai;
                 Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
                 Ai.rightCols<3>() = unitNormal.transpose();
@@ -433,7 +455,22 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             }
         }
 
+        std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n",
+                    iter, edgeCount, edgeLoss, patchCount, patchLoss, (edgeLoss + patchLoss));
+
+        if (iterCallback) {
+            pcl::PointCloud<PointXYZIR> currentAligned;
+            pcl::transformPointCloud(target.getFeatures(), currentAligned, currentGuess.matrix());
+            iterCallback(currentAligned, iter);
+        }
+
+        // Levenberg-Marquardt Damping
+        H += Eigen::Matrix<float, 6, 6>::Identity() * 0.1f;
+
         Eigen::Vector<float, 6> deltaTransform = H.ldlt().solve(-g);
+
+        // Step Relaxation
+        deltaTransform *= 0.5f;
 
         Eigen::Isometry3f nudge = Eigen::Isometry3f::Identity();
         float angle = deltaTransform.head<3>().norm();
@@ -452,13 +489,17 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         currentGuess.linear() = q.normalized().toRotationMatrix();
 
         if (deltaTransform.norm() < epsilon) {
+            std::printf("Converged at iteration %d!\n", iter);
             break;
         }
 
     }
 
-}
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end_time - start_time;
+    std::printf("--- scanMatching completed in %.2f ms ---\n", duration.count());
 
+}
 
 
 class GlobalMapNode : public rclcpp::Node {
@@ -467,7 +508,7 @@ public:
         // Subs and pubs
         subPoints_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/points_raw",
-            10,
+            50,
             std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1)
         );
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -487,6 +528,7 @@ public:
             "/local_map_lidar",
             10
         );
+        pubTest_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
 
 
         // Noise models (Covariances)
@@ -512,11 +554,16 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubIncrementalOdom_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubGlobalOdom_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMapDebug_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
 
     // LiDAR processing
     LocalMap localMap;
     const float keyframeTranslationThresh_ = 0.3f;   // 30 cm
     const float keyframeRotationThresh_ = 0.2618f;   // ~15 degrees in radians
+
+    // LiDAR odometry variables
+    std::deque<nav_msgs::msg::Odometry> imu_q_;
+    Eigen::Isometry3f current_lo_pose_ = Eigen::Isometry3f::Identity();
 
     // Factor graph variables
     int keyFrameID = 0;
@@ -542,68 +589,107 @@ private:
     double icpFitnessThreshold_ = 0.3;  // Lower is better
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-        // 1) Convert ROS -> PCL
+        // Convert ROS -> PCL
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
 
         LidarFrame LF = LidarFrame(*msg);
         LF.extract3DFeatures();
 
-        // @todo: Perform Scan Matching
+        // Construct initial guess and do scan matching
         const auto& keyframes = localMap.getKeyframes();
-        Eigen::Isometry3f currentTf = keyframes.empty()
-            ? Eigen::Isometry3f::Identity()
-            : keyframes.back().second;
-        scanMatching(localMap, LF, currentTf);
-
-        // TODO: Get relative pose. Scan matching gives pose wrt first frame
-        // Get the last stored LidarFrame and tf pair from the local map circular buffer
-        Eigen::Isometry3f relative_pose = currentTf;
-        bool isKeyFrame = false;
+        Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
         if (!keyframes.empty()) {
-            const auto& [lastLidarFrame, lastTf] = keyframes.back();
-            relative_pose = lastTf.inverse() * currentTf;
-            Eigen::AngleAxisf aa(relative_pose.rotation());
-            isKeyFrame = (relative_pose.translation().norm() > keyframeTranslationThresh_ || aa.angle() > keyframeRotationThresh_);
-            if (!isKeyFrame) {
-                return;
+            double cloud_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+            currentTf = keyframes.back().second;
+
+            // Use IMU orientation if available for the guess
+            if (!imu_q_.empty()) {
+                nav_msgs::msg::Odometry imu_odo_meas;
+                // TODO manage q with lock
+                while (!imu_q_.empty()) {
+                    imu_odo_meas = imu_q_.front();
+                    double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
+                    if (imu_time > cloud_time) {
+                        break;
+                    }
+                    imu_q_.pop_front();
+                }
+
+                // Extract the orientation from the IMU message
+                const auto& o = imu_odo_meas.pose.pose.orientation;
+                Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
+
+                // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
+                currentTf.linear() = imu_quat.normalized().toRotationMatrix();
+            }
+
+            auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
+                sensor_msgs::msg::PointCloud2 scanMsg;
+                pcl::toROSMsg(alignedCloud, scanMsg);
+                scanMsg.header = msg->header;
+                scanMsg.header.frame_id = "map";
+                pubTest_->publish(scanMsg);
+            };
+
+            scanMatching(localMap, LF, currentTf, visualizeIter);
+        }
+
+        // Publish whatever scan matching gives as the continuous odometry
+        publishIncrementalOdometry(currentTf, msg->header.stamp);
+
+        // Add a check for if tf greater than some threshold. If so add it as a keyframe
+        bool should_add_keyframe = false;
+        Eigen::Isometry3f delta = Eigen::Isometry3f::Identity();
+        if (keyframes.size() == 0) {
+            should_add_keyframe = true;
+        } else {
+            size_t last_idx = keyframes.size() - 1;
+            Eigen::Isometry3f last_pose = keyframes[last_idx].second;
+
+            delta = last_pose.inverse() * currentTf;
+
+            float translation_diff = delta.translation().norm();
+            float rotation_diff = std::abs(Eigen::AngleAxisf(delta.rotation()).angle());
+
+            // Thresholds: 0.5 meters or ~5.7 degrees (0.1 radians)
+            if (translation_diff > 0.5f || rotation_diff > 0.1f) {
+                should_add_keyframe = true;
             }
         }
 
-        // TODO: Publish whatever scan matching gives as the continuous odometry
-        publishIncrementalOdometry(currentTf, msg->header.stamp);
-
-        // @todo: Update Factor Graph with the pose
-        updateGraph(eigenIsometryToPose3(relative_pose));
-
-        // @todo: Detect Loop Closure
-        detectLoopClosure(currentCloud);
-
-        // @todo: Optimize the factor graph
-        isam_->update(gtSAMgraph_, initialEstimate_);
-        isam_->update(); // Often called twice to ensure convergence
-
-        // Clear graph and estimates for next iteration
-        gtSAMgraph_.resize(0);
-        initialEstimate_.clear();
-
-        // Publish global odometry
-        gtsam::Values currentEstimate = isam_->calculateEstimate();
-        Eigen::Isometry3f CurrentGlobalTf = pose3ToEigenIsometry(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', keyFrameID - 1)));
-        publishGlobalOdometry(CurrentGlobalTf, msg->header.stamp);
-
-        // Add logging
-        RCLCPP_INFO(this->get_logger(), "Received %zu points", currentCloud->points.size());
+        if (!should_add_keyframe) {
+            return;
+        }
 
         // Add the current keyframe to the local map
         localMap.pushKeyframe({LF, currentTf});
         RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
-        publishLocalMap(msg->header.stamp);
+        // // Update Factor Graph with the pose
+        // updateGraph(eigenIsometryToPose3(delta));
+
+        // // Detect Loop Closure
+        // detectLoopClosure(currentCloud);
+
+        // // Optimize the factor graph
+        // isam_->update(gtSAMgraph_, initialEstimate_);
+        // isam_->update(); // Often called twice to ensure convergence
+
+        // // Clear graph and estimates for next iteration
+        // gtSAMgraph_.resize(0);
+        // initialEstimate_.clear();
+
+        // // Publish global odometry
+        // gtsam::Values currentEstimate = isam_->calculateEstimate();
+        // Eigen::Isometry3f CurrentGlobalTf = pose3ToEigenIsometry(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', keyFrameID - 1)));
+        // publishGlobalOdometry(CurrentGlobalTf, msg->header.stamp);
+
+        // publishLocalMap(msg->header.stamp);
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        // @todo: Implement IMU-based odometry update
+        imu_q_.push_back(*msg);
     }
 
     void updateGraph(const gtsam::Pose3& odomStep) {
