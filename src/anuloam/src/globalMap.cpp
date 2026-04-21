@@ -583,7 +583,10 @@ private:
     // Keyframe variables
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloudKeyPoses3D_{new pcl::PointCloud<pcl::PointXYZ>()};
     std::vector<gtsam::Pose3> cloudKeyPoses6D_;
+
     std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> cloudKeyframes_;
+
+
     pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
 
     // Loop Closure Parameters
@@ -592,6 +595,8 @@ private:
     double icpFitnessThreshold_ = 0.3;  // Lower is better
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        auto cb_start = std::chrono::high_resolution_clock::now();
+
         // Convert ROS -> PCL
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
@@ -662,6 +667,8 @@ private:
         }
 
         if (!should_add_keyframe) {
+            std::chrono::duration<double, std::milli> cb_dur = std::chrono::high_resolution_clock::now() - cb_start;
+            std::printf("--- pointCloudCallback (no keyframe) completed in %.2f ms ---\n", cb_dur.count());
             return;
         }
 
@@ -674,25 +681,28 @@ private:
         // Update Factor Graph with the pose
         updateGraph(eigenIsometryToPose3(delta));
 
-        // // Detect Loop Closure
+        // Detect Loop Closure
         detectLoopClosure(currentCloud);
 
         // Optimize the factor graph
-        // isam_->update(gtSAMgraph_, initialEstimate_);
-        // isam_->update();
+        isam_->update(gtSAMgraph_, initialEstimate_);
+        isam_->update();
 
         // Clear graph and estimates for next iteration
-        // gtSAMgraph_.resize(0);
-        // initialEstimate_.clear();
+        gtSAMgraph_.resize(0);
+        initialEstimate_.clear();
 
         // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
-        // gtsam::Values currentEstimate = isam_->calculateEstimate();
-        // cloudKeyPoses6D_.clear();
-        // for (int i = 0; i < keyFrameID; ++i) {
-        //     cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
-        // }
+        gtsam::Values currentEstimate = isam_->calculateEstimate();
+        cloudKeyPoses6D_.clear();
+        for (int i = 0; i < keyFrameID; ++i) {
+            cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
+        }
 
-        publishGlobalMap(msg->header.stamp);
+        // publishGlobalMap(msg->header.stamp);
+
+        std::chrono::duration<double, std::milli> cb_dur = std::chrono::high_resolution_clock::now() - cb_start;
+        std::printf("--- pointCloudCallback (keyframe) completed in %.2f ms ---\n", cb_dur.count());
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -738,27 +748,28 @@ private:
         cloudKeyframes_.push_back(currentCloud);
 
         // Add return to visualize global map without loop closure
-        return;
+        // return;
 
         int currentID = cloudKeyPoses3D_->size() - 1;
 
         // We need a minimum amount of history to even attempt a loop closure
         if (currentID < historySearchTimeDiff_) {
+            RCLCPP_DEBUG(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", currentID, historySearchTimeDiff_);
             return;
         }
 
-        // 2. Build the KD-Tree using our trajectory
+        // Build the KD-Tree using our trajectory
         kdtreeHistoryKeyPoses_->setInputCloud(cloudKeyPoses3D_);
 
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
 
-        // 3. Search for historical poses within a certain radius (e.g., 15 meters)
+        // Search for historical poses within a certain radius (e.g., 15 meters)
         kdtreeHistoryKeyPoses_->radiusSearch(currentPose3D, historySearchRadius_, pointSearchInd, pointSearchSqDis);
 
         int loopMatchID = -1;
 
-        // 4. Filter matches: We only want poses from the past, not recent frames
+        // Filter matches: We only want poses from the past, not recent frames
         for (size_t i = 0; i < pointSearchInd.size(); ++i) {
             int candidateID = pointSearchInd[i];
             if (currentID - candidateID > historySearchTimeDiff_) {
@@ -767,11 +778,13 @@ private:
             }
         }
 
+        // If no valid loop closures found, return
         if (loopMatchID == -1) {
-            return; // No valid loop closures found
+            RCLCPP_DEBUG(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", currentID, historySearchTimeDiff_);
+            return;
         }
 
-        // 5. Verification: Run ICP between current cloud and historical cloud
+        // Verification: Run ICP between current cloud and historical cloud
         pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
         icp.setMaxCorrespondenceDistance(1.5); // Max distance to associate points
         icp.setMaximumIterations(100);
@@ -779,14 +792,22 @@ private:
         icp.setEuclideanFitnessEpsilon(1e-6);
         icp.setInputSource(currentCloud);
         icp.setInputTarget(cloudKeyframes_[loopMatchID]);
-        gtsam::Values estimate = isam_->calculateEstimate();
+
+        // Current pose estimate wrt map frame
         gtsam::Pose3 pCurrent = currentPoseEstimate;
+
+        // Previou pose estimate wrt map frame
+        gtsam::Values estimate = isam_->calculateEstimate();
         gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
+
+        // Initial guess for transform between current and previous point clouds
         Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
+
+        // Run ICP
         pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
         icp.align(*unused_result, initialGuess);
 
-        // 6. Evaluate and Add to Graph
+        // Evaluate and Add to Graph
         if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
             RCLCPP_DEBUG(this->get_logger(), "Loop closure rejected. Fitness: %f", icp.getFitnessScore());
             return;
@@ -803,7 +824,7 @@ private:
         gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
         gtsam::Pose3 loopPose(rot, trans);
 
-        // 7. Add Loop Closure Factor to the Graph
+        // Add Loop Closure Factor to the Graph
         // Note: Loop closures usually get a slightly less confident noise model than consecutive odometry
         gtsam::Vector6 loopSigmas;
         loopSigmas << 0.1, 0.1, 0.1, 0.2, 0.2, 0.2;
