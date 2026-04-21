@@ -51,7 +51,7 @@ public:
     LidarFrame() = default;
     LidarFrame(const pcl::PointCloud<PointXYZIR>& cloud) : _pcl (cloud) {};
     LidarFrame(const sensor_msgs::msg::PointCloud2& msg) { pcl::fromROSMsg(msg, _pcl); }
-    
+
     /**
      * @brief extract 2D scans for every ring in the 3D pointcloud scan
      * @param cloud 3D input scan of with ring information
@@ -69,7 +69,7 @@ public:
     };
 
     float computeRoughness(const pcl::PointCloud<PointXYZIR>& ring, size_t ind) {
-        
+
         float norm = ring[ind].x * ring[ind].x + ring[ind].y * ring[ind].y + ring[ind].z * ring[ind].z;
         if (norm < minRange * minRange || norm > maxRange * maxRange) {
             return -1.0f; // r < 0 filtered out later
@@ -102,11 +102,11 @@ public:
      * @todo: Multithreading
      */
     void extract2DFeatures(
-        const pcl::PointCloud<PointXYZIR>& ring, 
-        pcl::PointCloud<PointXYZIR>& edgeFeatures, 
+        const pcl::PointCloud<PointXYZIR>& ring,
+        pcl::PointCloud<PointXYZIR>& edgeFeatures,
         pcl::PointCloud<PointXYZIR>& planarFeatures
     ) {
-        
+
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
         size_t numSections = 8;
@@ -115,7 +115,7 @@ public:
 
         // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
-            
+
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
             size_t currentFeatures = 0;
@@ -136,8 +136,8 @@ public:
             size_t kEdge = std::min(static_cast<size_t>(edgeFeaturesPerSection), roughnesses.size());
 
             std::partial_sort(
-                roughnesses.begin(), 
-                roughnesses.begin() + kEdge, 
+                roughnesses.begin(),
+                roughnesses.begin() + kEdge,
                 roughnesses.end(),
                 [](const auto& a, const auto& b) { return a.roughness > b.roughness; }
             );
@@ -147,13 +147,13 @@ public:
                     edgeFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
-            
+
             // append k smoothest points (i.e. patches) to _patches
             size_t kPatch = std::min(static_cast<size_t>(planarFeaturesPerSection), roughnesses.size());
 
             std::partial_sort(
-                roughnesses.begin(), 
-                roughnesses.begin() + kPatch, 
+                roughnesses.begin(),
+                roughnesses.begin() + kPatch,
                 roughnesses.end(),
                 [](const auto& a, const auto& b) { return a.roughness < b.roughness; }
             );
@@ -185,7 +185,7 @@ public:
             this->extract2DFeatures(this->_rings[i], edgeBuckets[i], planarBuckets[i]);
         }
 
-        // collate returned data back into the edge and patches 
+        // collate returned data back into the edge and patches
         for (size_t i=0; i<NUM_RINGS; i++) {
             this->_edges += edgeBuckets[i];
             this->_patches += planarBuckets[i];
@@ -220,34 +220,34 @@ private:
     pcl::PointCloud<PointXYZIR> _edges;
     pcl::PointCloud<PointXYZIR> _patches;
     pcl::PointCloud<PointXYZIR> _features;
-    int neighbours = 16; 
-    float edgeThresh = 0.25; 
-    float planarThresh = 1e-4; //1e-4; 
+    int neighbours = 16;
+    float edgeThresh = 0.25;
+    float planarThresh = 1e-4; //1e-4;
     int totalFeatures = 32;
     float minRange = 1.0;
     float maxRange = 20.0;
 };
 
 /**
- * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud. 
+ * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud.
  * Challenge is the design of removal of earlier pointclouds
  */
 class LocalMap {
 public:
-    
-    LocalMap(size_t size) : 
+
+    LocalMap(size_t size) :
         _keyframes(size),
         _voxelEdges(new pcl::PointCloud<PointXYZIR>()),
         _voxelPatches(new pcl::PointCloud<PointXYZIR>()),
         _upsampledPCL(new pcl::PointCloud<PointXYZIR>())
     {}
-    
+
     const CircularBuffer<std::pair<LidarFrame, Eigen::Isometry3f>>& getKeyframes() const { return _keyframes; }
-    
+
     /**
      * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
      */
-    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) { 
+    void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
@@ -269,7 +269,7 @@ public:
         // Downsample Edges (0.2m voxel length)
         pcl::VoxelGrid<PointXYZIR> edgeFilter;
         edgeFilter.setLeafSize(0.2f, 0.2f, 0.2f);
-        edgeFilter.setInputCloud(rawEdges); 
+        edgeFilter.setInputCloud(rawEdges);
         edgeFilter.filter(*_voxelEdges);
 
         // Downsample Patches (0.4m voxel length)
@@ -330,7 +330,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
     const float maxDistSq = 1.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
-            
+
         // Go over the incoming LidarFrame
         Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
         Eigen::Vector<float, 6> g = Eigen::Vector<float, 6>::Zero();
@@ -348,7 +348,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<int> indices;
             std::vector<float> dists;
             if (map.findEdgeNeighbors(edge, indices, dists)) {
-                if (dists[1] > maxDistSq) continue; 
+                if (dists[1] > maxDistSq) continue;
 
                 Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
@@ -378,9 +378,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // Right side: Translation (delta_t) -> -[vUnit]_x
                 Ai.rightCols<3>() = -vSkew;
 
-                H.noalias() += Ai.transpose() * Ai; 
+                H.noalias() += Ai.transpose() * Ai;
                 g.noalias() += Ai.transpose() * bi;
-        
+
             }
         }
 
@@ -390,7 +390,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<float> dists;
 
             if (map.findPlaneNeighbors(patch, indices, dists)) {
-                if (dists[2] > maxDistSq) continue; 
+                if (dists[2] > maxDistSq) continue;
 
                 Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
@@ -418,7 +418,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 Ai.leftCols<3>() = pi.cross(unitNormal).transpose();
                 Ai.rightCols<3>() = unitNormal.transpose();
 
-                H.noalias() += Ai.transpose() * Ai; 
+                H.noalias() += Ai.transpose() * Ai;
                 g.noalias() += Ai.transpose() * bi;
             }
         }
@@ -449,7 +449,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             // Fallback to identity + skew for infinitesimally small angles to avoid div by zero
             nudge.linear() = Eigen::Matrix3f::Identity() + skew(deltaTransform.head<3>());
         }
-            
+
         nudge.translation() = deltaTransform.tail<3>();
         currentGuess = nudge * currentGuess;
 
@@ -460,7 +460,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::printf("Converged at iteration %d!\n", iter);
             break;
         }
-    
+
     }
     
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -502,13 +502,14 @@ private:
     LidarFrame LF = LidarFrame(*msg);
     pcl::PointCloud<PointXYZIR> subCloud = LF.getPCL();
     LF.extractRings(subCloud);
+
     std::vector<pcl::PointCloud<PointXYZIR>> rings = LF.getRings();
 
     // Convert PCL -> ROS message and publish
     // pcl::Indices indices(200);
     // std::iota(indices.begin(), indices.end(), 0);
 
-    
+
     LF.extract3DFeatures();
     pcl::PointCloud<PointXYZIR> features = LF.getFeatures();
 

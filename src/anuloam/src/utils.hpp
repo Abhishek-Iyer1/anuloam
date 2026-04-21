@@ -25,6 +25,14 @@ public:
         else {return _head;}
     }
 
+    bool empty() const { return !_isFull && _head == 0; }
+
+    const T& back() const {
+        assert(!empty() && "CircularBuffer: back() called on empty buffer!");
+        size_t lastIdx = (_head == 0) ? _maxSize - 1 : _head - 1;
+        return _data[lastIdx];
+    }
+
     /**
      * @warn: You are indexing chronologically, such that 0 is the oldest data point
      */
