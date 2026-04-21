@@ -28,6 +28,8 @@
 
 #include <Eigen/Geometry>
 
+#include <chrono> 
+#include <mutex> 
 #include "utils.hpp"
 
 #define NUM_RINGS 16
@@ -75,7 +77,7 @@ struct PointRoughness {
 
 
 /**
- *  @todo: Need to support each point in the scan having a timestamp parameter
+ * @todo: Need to support each point in the scan having a timestamp parameter
  */
 class LidarFrame {
 public:
@@ -351,11 +353,10 @@ private:
  * @note: Both map and target must be in a common frame
  */
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
-                  std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
-
+    std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
+        
+    PROFILE_BLOCK("scanMatching");
     if (map.getKeyframes().size() == 0) {return;}
-
-    auto start_time = std::chrono::high_resolution_clock::now();
 
     const int maxIterations = 50;
     const float epsilon = 1e-5;
@@ -379,7 +380,13 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             Eigen::Vector3f pi = edge.getVector3fMap();
             std::vector<int> indices;
             std::vector<float> dists;
-            if (map.findEdgeNeighbors(edge, indices, dists)) {
+            bool found;
+            {
+                // PROFILE_BLOCK("KDTree_Edge_Search");
+                found = map.findEdgeNeighbors(edge, indices, dists);
+            }
+            if (found) {
+                // PROFILE_BLOCK("Edge_Jacobian_Calculation");
                 if (dists[1] > maxDistSq) continue;
 
                 Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
@@ -420,8 +427,13 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             Eigen::Vector3f pi = patch.getVector3fMap();
             std::vector<int> indices;
             std::vector<float> dists;
-
-            if (map.findPlaneNeighbors(patch, indices, dists)) {
+            bool found;
+            {
+                // PROFILE_BLOCK("KDTree_Plane_Search");
+                found = map.findPlaneNeighbors(patch, indices, dists);
+            }
+            if (found) {
+                // PROFILE_BLOCK("Plane_Jacobian_Calculation");
                 if (dists[2] > maxDistSq) continue;
 
                 Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
@@ -495,27 +507,36 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> duration = end_time - start_time;
-    std::printf("--- scanMatching completed in %.2f ms ---\n", duration.count());
-
 }
 
 
 class GlobalMapNode : public rclcpp::Node {
 public:
     GlobalMapNode() : Node("global_map"), localMap(50){
+        // Threading and Safety setup
+        imu_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        lidar_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        timer_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
         // Subs and pubs
+        rclcpp::SubscriptionOptions lidar_options;
+        lidar_options.callback_group = lidar_cb_group_;
         subPoints_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "/points_raw",
             50,
-            std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1)
+            std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1),
+            lidar_options
         );
+        
+        rclcpp::SubscriptionOptions imu_options;
+        imu_options.callback_group = imu_cb_group_;
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/odom_imu",
             10,
-            std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1)
+            std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1),
+            imu_options
         );
+        
         pubIncrementalOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(
             "/odom_incremental",
             10
@@ -530,6 +551,13 @@ public:
         );
         pubTest_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
         pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
+
+        // Create the 1Hz Timer for the Global Map
+        map_timer_ = this->create_wall_timer(
+            std::chrono::seconds(1),
+            std::bind(&GlobalMapNode::globalMapTimerCallback, this),
+            timer_cb_group_
+        );
 
 
         // Noise models (Covariances)
@@ -549,6 +577,14 @@ public:
     }
 
 private:
+    // Threading and Safety
+    rclcpp::CallbackGroup::SharedPtr imu_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr lidar_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr timer_cb_group_;
+    rclcpp::TimerBase::SharedPtr map_timer_;
+    std::mutex imu_mutex_;
+    std::mutex map_mutex_;
+
     // Subs and pubs
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subPoints_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subImuOdom_;
@@ -595,8 +631,7 @@ private:
     double icpFitnessThreshold_ = 0.3;  // Lower is better
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-        auto cb_start = std::chrono::high_resolution_clock::now();
-
+        PROFILE_BLOCK("PointCloud_Callback");
         // Convert ROS -> PCL
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
@@ -612,27 +647,31 @@ private:
             currentTf = keyframes.back().second;
 
             // Use IMU orientation if available for the guess
-            if (!imu_q_.empty()) {
-                nav_msgs::msg::Odometry imu_odo_meas;
-                // TODO manage q with lock
-                while (!imu_q_.empty()) {
-                    imu_odo_meas = imu_q_.front();
-                    double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
-                    if (imu_time > cloud_time) {
-                        break;
+            {
+                std::lock_guard<std::mutex> lock(imu_mutex_); 
+                if (!imu_q_.empty()) {
+                    nav_msgs::msg::Odometry imu_odo_meas;
+                    // TODO manage q with lock
+                    while (!imu_q_.empty()) {
+                        imu_odo_meas = imu_q_.front();
+                        double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
+                        if (imu_time > cloud_time) {
+                            break;
+                        }
+                        imu_q_.pop_front();
                     }
-                    imu_q_.pop_front();
+
+                    // Extract the orientation from the IMU message
+                    const auto& o = imu_odo_meas.pose.pose.orientation;
+                    Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
+
+                    // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
+                    currentTf.linear() = imu_quat.normalized().toRotationMatrix();
                 }
-
-                // Extract the orientation from the IMU message
-                const auto& o = imu_odo_meas.pose.pose.orientation;
-                Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
-
-                // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
-                currentTf.linear() = imu_quat.normalized().toRotationMatrix();
             }
 
             auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
+                (void)iter; // Fixes unused parameter warning
                 sensor_msgs::msg::PointCloud2 scanMsg;
                 pcl::toROSMsg(alignedCloud, scanMsg);
                 scanMsg.header = msg->header;
@@ -699,17 +738,21 @@ private:
             cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
         }
 
-        // publishGlobalMap(msg->header.stamp);
-
-        std::chrono::duration<double, std::milli> cb_dur = std::chrono::high_resolution_clock::now() - cb_start;
-        std::printf("--- pointCloudCallback (keyframe) completed in %.2f ms ---\n", cb_dur.count());
+        // REMOVED: publishGlobalMap(msg->header.stamp); 
+        // (This is now handled by the 1Hz Timer!)
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(imu_mutex_);
         imu_q_.push_back(*msg);
+    }
+    
+    void globalMapTimerCallback() {
+        publishGlobalMap(this->now());
     }
 
     void updateGraph(const gtsam::Pose3& odomStep) {
+        PROFILE_BLOCK("Update_Graph");
         gtsam::Symbol currentKey('X', keyFrameID);
 
         // Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
@@ -734,18 +777,23 @@ private:
     }
 
     void detectLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud) {
+        PROFILE_BLOCK("LoopClosures");
         // @todo: Implement KD-Tree search on historical poses.
         // If distance < threshold, perform ICP between current cloud and historical cloud.
         // If ICP fitness score is good, add a gtsam::BetweenFactor to gtSAMgraph_.
 
         // 1. Save the current pose and cloud into our history
-        pcl::PointXYZ currentPose3D;
-        currentPose3D.x = currentPoseEstimate.translation().x();
-        currentPose3D.y = currentPoseEstimate.translation().y();
-        currentPose3D.z = currentPoseEstimate.translation().z();
-        cloudKeyPoses3D_->push_back(currentPose3D);
-        cloudKeyPoses6D_.push_back(currentPoseEstimate);
-        cloudKeyframes_.push_back(currentCloud);
+        // LOCK THE MAP VECTOR WHILE WE ADD TO IT
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            pcl::PointXYZ currentPose3D;
+            currentPose3D.x = currentPoseEstimate.translation().x();
+            currentPose3D.y = currentPoseEstimate.translation().y();
+            currentPose3D.z = currentPoseEstimate.translation().z();
+            cloudKeyPoses3D_->push_back(currentPose3D);
+            cloudKeyPoses6D_.push_back(currentPoseEstimate);
+            cloudKeyframes_.push_back(currentCloud);
+        }
 
         // Add return to visualize global map without loop closure
         // return;
@@ -764,8 +812,8 @@ private:
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
 
-        // Search for historical poses within a certain radius (e.g., 15 meters)
-        kdtreeHistoryKeyPoses_->radiusSearch(currentPose3D, historySearchRadius_, pointSearchInd, pointSearchSqDis);
+        // 3. Search for historical poses within a certain radius (e.g., 15 meters)
+        kdtreeHistoryKeyPoses_->radiusSearch(pcl::PointXYZ(currentPoseEstimate.translation().x(), currentPoseEstimate.translation().y(), currentPoseEstimate.translation().z()), historySearchRadius_, pointSearchInd, pointSearchSqDis);
 
         int loopMatchID = -1;
 
@@ -838,6 +886,7 @@ private:
     }
 
     void publishLocalMap(const rclcpp::Time& timestamp) {
+        PROFILE_BLOCK("publishLocalMap");
         sensor_msgs::msg::PointCloud2 cloudMsg;
         pcl::toROSMsg(localMap.getVoxels(), cloudMsg);
         cloudMsg.header.stamp = timestamp;
@@ -846,19 +895,29 @@ private:
     }
 
     void publishGlobalMap(const rclcpp::Time& timestamp) {
-        if (cloudKeyframes_.empty()) return;
+        PROFILE_BLOCK("publishGlobalMap");
+        
+        // Lock and copy so the timer thread doesn't crash when LiDAR thread adds a new frame
+        std::vector<gtsam::Pose3> poses_copy;
+        std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (cloudKeyframes_.empty()) return;
+            poses_copy = cloudKeyPoses6D_;
+            frames_copy = cloudKeyframes_;
+        }
 
         pcl::VoxelGrid<pcl::PointXYZI> perFrameFilter;
         perFrameFilter.setLeafSize(0.2f, 0.2f, 0.2f);
 
         pcl::PointCloud<pcl::PointXYZI> globalCloud;
-        for (size_t i = 0; i < cloudKeyframes_.size(); ++i) {
+        for (size_t i = 0; i < frames_copy.size(); ++i) {
             pcl::PointCloud<pcl::PointXYZI> downsampled;
-            perFrameFilter.setInputCloud(cloudKeyframes_[i]);
+            perFrameFilter.setInputCloud(frames_copy[i]);
             perFrameFilter.filter(downsampled);
 
             pcl::PointCloud<pcl::PointXYZI> transformed;
-            Eigen::Isometry3f pose = pose3ToEigenIsometry(cloudKeyPoses6D_[i]);
+            Eigen::Isometry3f pose = pose3ToEigenIsometry(poses_copy[i]);
             pcl::transformPointCloud(downsampled, transformed, pose.matrix());
             globalCloud += transformed;
         }
@@ -911,7 +970,17 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<GlobalMapNode>());
+    
+    // Create the node
+    auto node = std::make_shared<GlobalMapNode>(); 
+    
+    // Create a multi-threaded executor
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    
+    // Add the node to the executor and spin
+    executor.add_node(node);
+    executor.spin();
+    
     rclcpp::shutdown();
     return 0;
 }

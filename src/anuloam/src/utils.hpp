@@ -2,6 +2,9 @@
 #include <cassert>
 #include <Eigen/Geometry>
 #include <builtin_interfaces/msg/time.hpp>
+#include <chrono>
+#include <string>
+#include <cstdio>
 
 template <typename T>
 class CircularBuffer {
@@ -62,3 +65,19 @@ inline Eigen::Matrix3f skew(const Eigen::Vector3f& v) {
 inline double stamp2sec(const builtin_interfaces::msg::Time& stamp) {
     return stamp.sec + stamp.nanosec * 1e-9;
 }
+
+struct ScopedTimer {
+    std::string name;
+    std::chrono::high_resolution_clock::time_point start;
+
+    ScopedTimer(std::string n) : name(n), start(std::chrono::high_resolution_clock::now()) {}
+
+    ~ScopedTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> duration = end - start;
+        std::printf("[PROFILE] %s took %.3f ms\n", name.c_str(), duration.count());
+    }
+};
+
+// Macro to make it easy to drop into any block
+#define PROFILE_BLOCK(name) ScopedTimer timer_##__LINE__(name)
