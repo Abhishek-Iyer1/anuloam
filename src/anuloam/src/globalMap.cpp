@@ -31,8 +31,8 @@
 #include <Eigen/Geometry>
 
 #include <unordered_map>
-#include <chrono> 
-#include <mutex> 
+#include <chrono>
+#include <mutex>
 #include "utils.hpp"
 
 #define NUM_RINGS 16
@@ -95,28 +95,28 @@ struct VoxelData {
 };
 
 /**
- * @brief Stateful Voxel Hash Map. 
+ * @brief Stateful Voxel Hash Map.
  * Performs O(1) weighted running averages (merges) and O(1) rolling back (removals).
  */
 class GlobalPointMap {
 public:
-    GlobalPointMap(float leaf_size = 0.4f, float max_range = 30.0f, float min_weight = 5.0f) 
+    GlobalPointMap(float leaf_size = 0.4f, float max_range = 30.0f, float min_weight = 5.0f)
         : leaf_size_(leaf_size), max_range_sq_(max_range * max_range), min_weight_(min_weight) {
-        voxel_map_.reserve(100000); 
+        voxel_map_.reserve(100000);
     }
 
     void update(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
         PROFILE_BLOCK("GlobalPointMap_update");
         Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
-        
+
         // Loop directly over the incoming frame, no intermediate downsampling needed
         for (const auto& pt : frame->points) {
             float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-            if (dist_sq > max_range_sq_) continue; 
+            if (dist_sq > max_range_sq_) continue;
 
             Eigen::Vector3f p(pt.x, pt.y, pt.z);
             Eigen::Vector3f p_world = transform * p;
-            
+
             Eigen::Vector3i voxel_idx(
                 std::floor(p_world.x() / leaf_size_),
                 std::floor(p_world.y() / leaf_size_),
@@ -129,7 +129,7 @@ public:
             } else {
                 float w_old = it->second.weight;
                 float w_new = w_old + 1.0f;
-                
+
                 it->second.point = (it->second.point * w_old + p_world) / w_new;
                 it->second.intensity = (it->second.intensity * w_old + pt.intensity) / w_new;
                 it->second.weight = w_new;
@@ -139,15 +139,15 @@ public:
 
     void remove(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
         Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
-        
+
         // Loop directly over the incoming frame
         for (const auto& pt : frame->points) {
             float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-            if (dist_sq > max_range_sq_) continue; 
+            if (dist_sq > max_range_sq_) continue;
 
             Eigen::Vector3f p(pt.x, pt.y, pt.z);
             Eigen::Vector3f p_world = transform * p;
-            
+
             Eigen::Vector3i voxel_idx(
                 std::floor(p_world.x() / leaf_size_),
                 std::floor(p_world.y() / leaf_size_),
@@ -158,7 +158,7 @@ public:
             if (it != voxel_map_.end()) {
                 float w_old = it->second.weight;
                 float w_new = w_old - 1.0f;
-                
+
                 // If weight hits 0, erase the voxel entirely to save memory
                 if (w_new < 0.1f) {
                     voxel_map_.erase(it);
@@ -177,27 +177,27 @@ public:
 
         for (const auto& kv : voxel_map_) {
             if (kv.second.weight < min_weight_) {
-                continue; 
+                continue;
             }
             pcl::PointXYZI pt;
             pt.x = kv.second.point.x();
             pt.y = kv.second.point.y();
             pt.z = kv.second.point.z();
-            pt.intensity = kv.second.weight; 
+            pt.intensity = kv.second.weight;
             out_cloud->push_back(pt);
         }
-        
+
         out_cloud->width = out_cloud->points.size();
         out_cloud->height = 1;
         out_cloud->is_dense = true;
-        
+
         return out_cloud;
     }
 
 private:
     float leaf_size_;
-    float max_range_sq_; 
-    float min_weight_; 
+    float max_range_sq_;
+    float min_weight_;
     std::unordered_map<Eigen::Vector3i, VoxelData, VoxelHash> voxel_map_;
 };
 
@@ -387,7 +387,7 @@ private:
  * @todo: Could make this more efficient by adding to localMap on being received as opposed to on getPointCloud.
  * Challenge is the design of removal of earlier pointclouds
  */
- class LocalMap {
+class LocalMap {
 public:
 
     LocalMap(size_t size) :
@@ -476,7 +476,7 @@ private:
  */
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
     std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
-        
+
     PROFILE_BLOCK("scanMatching");
     if (map.getKeyframes().size() == 0) {return;}
 
@@ -646,7 +646,7 @@ public:
             std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1),
             lidar_options
         );
-        
+
         rclcpp::SubscriptionOptions imu_options;
         imu_options.callback_group = imu_cb_group_;
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -655,7 +655,7 @@ public:
             std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1),
             imu_options
         );
-        
+
         pubIncrementalOdom_ = this->create_publisher<nav_msgs::msg::Odometry>(
             "/odom_incremental",
             10
@@ -781,7 +781,7 @@ private:
 
             // Use IMU orientation if available for the guess
             {
-                std::lock_guard<std::mutex> lock(imu_mutex_); 
+                std::lock_guard<std::mutex> lock(imu_mutex_);
                 if (!imu_q_.empty()) {
                     nav_msgs::msg::Odometry imu_odo_meas;
                     // TODO manage q with lock
@@ -843,8 +843,6 @@ private:
         }
 
         if (!should_add_keyframe) {
-            std::chrono::duration<double, std::milli> cb_dur = std::chrono::high_resolution_clock::now() - cb_start;
-            std::printf("--- pointCloudCallback (no keyframe) completed in %.2f ms ---\n", cb_dur.count());
             return;
         }
 
@@ -872,9 +870,9 @@ private:
 
             // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
             gtsam::Values currentEstimate = isam_->calculateEstimate();
-            
+
             {
-                // Lock while we safely update the ISAM2 corrected poses 
+                // Lock while we safely update the ISAM2 corrected poses
                 std::lock_guard<std::mutex> lock(map_mutex_);
                 cloudKeyPoses6D_.clear();
                 for (int i = 0; i < keyFrameID; ++i) {
@@ -889,7 +887,7 @@ private:
         std::lock_guard<std::mutex> lock(imu_mutex_);
         imu_q_.push_back(*msg);
     }
-    
+
     void globalMapTimerCallback() {
         publishGlobalMap(this->now());
     }
@@ -923,7 +921,7 @@ private:
      * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
      */
     void detectLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud) {
-        
+
         // === DOWNSAMPLE BEFORE SAVING ===
         pcl::PointCloud<pcl::PointXYZI>::Ptr downsampledCloud(new pcl::PointCloud<pcl::PointXYZI>());
         loop_closure_filter_.setInputCloud(currentCloud);
@@ -938,9 +936,9 @@ private:
             currentPose3D.z = currentPoseEstimate.translation().z();
             cloudKeyPoses3D_->push_back(currentPose3D);
             cloudKeyPoses6D_.push_back(currentPoseEstimate);
-            
+
             // Push the lightweight cloud, not the heavy one!
-            cloudKeyframes_.push_back(downsampledCloud); 
+            cloudKeyframes_.push_back(downsampledCloud);
         }
 
         // uncomment to stop Loop closure to run AND not add linear factors between poses from LO
@@ -984,22 +982,22 @@ private:
         {
             PROFILE_BLOCK("Global_map_icp");
             pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
-            icp.setMaxCorrespondenceDistance(1.5); 
+            icp.setMaxCorrespondenceDistance(1.5);
             icp.setMaximumIterations(100);
             icp.setTransformationEpsilon(1e-6);
             icp.setEuclideanFitnessEpsilon(1e-6);
-            
+
             // === USE THE LIGHTWEIGHT CLOUD FOR ICP ===
             icp.setInputSource(downsampledCloud);
             icp.setInputTarget(cloudKeyframes_[loopMatchID]);
-            
+
             // TODO: Does calculateEstimate() run optimization under the hood?
             // One between factor has already been added. Maybe that is why we are optimizing
             gtsam::Values estimate = isam_->calculateEstimate();
             gtsam::Pose3 pCurrent = currentPoseEstimate;
             gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
 
-            // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely) 
+            // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely)
             Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
             pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
             icp.align(*unused_result, initialGuess);
@@ -1028,7 +1026,7 @@ private:
 
             gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 historicalKey, currentKey, loopPose, loopNoise));
-                
+
             // No more loop closure boolean required! The incremental solver handles it.
         }
     }
@@ -1043,14 +1041,14 @@ private:
 
     void publishGlobalMap(const rclcpp::Time& timestamp) {
         PROFILE_BLOCK("publishGlobalMap");
-        
+
         std::vector<gtsam::Pose3> poses_copy;
         std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
 
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (cloudKeyframes_.empty()) return;
-            
+
             poses_copy = cloudKeyPoses6D_;
             frames_copy = cloudKeyframes_;
         }
@@ -1064,7 +1062,7 @@ private:
                 published_poses_.push_back(poses_copy[i]);
             } else {
                 // 2. EXISTING FRAME: Did ISAM2 move it incrementally?
-                if (!published_poses_[i].equals(poses_copy[i], 1e-4)) { 
+                if (!published_poses_[i].equals(poses_copy[i], 1e-4)) {
                     // Rollback the old voxel merge
                     global_point_map_.remove(frames_copy[i], published_poses_[i]);
                     // Apply the new corrected ISAM2 pose
@@ -1134,17 +1132,17 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    
+
     // Create the node
-    auto node = std::make_shared<GlobalMapNode>(); 
-    
+    auto node = std::make_shared<GlobalMapNode>();
+
     // Create a multi-threaded executor
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
-    
+
     // Add the node to the executor and spin
     executor.add_node(node);
     executor.spin();
-    
+
     rclcpp::shutdown();
     return 0;
 }
