@@ -96,43 +96,27 @@ struct VoxelData {
 
 /**
  * @brief Stateful Voxel Hash Map. 
- * Performs O(1) weighted running averages (merges) for the Global Map visualization.
+ * Performs O(1) weighted running averages (merges) and O(1) rolling back (removals).
  */
 class GlobalPointMap {
 public:
-    // Added min_weight threshold. 2.0f means a point must be seen at least twice.
     GlobalPointMap(float leaf_size = 0.4f, float max_range = 30.0f, float min_weight = 5.0f) 
         : leaf_size_(leaf_size), max_range_sq_(max_range * max_range), min_weight_(min_weight) {
         voxel_map_.reserve(100000); 
-        // We set the pre-filter leaf size to match the hash map. 
-        // This ensures we only do ~1 hash lookup per voxel per incoming frame.
-        perFrameFilter_.setLeafSize(leaf_size_, leaf_size_, leaf_size_); 
     }
 
-    // FAST PATH: Downsample, Hash, and Merge points using a weighted average
     void update(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
-        
-        // 1. Downsample the incoming cloud FIRST to save computation
-        pcl::PointCloud<pcl::PointXYZI>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZI>());
-        perFrameFilter_.setInputCloud(frame);
-        perFrameFilter_.filter(*downsampled);
-
+        PROFILE_BLOCK("GlobalPointMap_update");
         Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
         
-        // 2. Transform and Merge the downsampled points
-        for (const auto& pt : downsampled->points) {
-            
-            // MAX RANGE FILTER
-            // Since pt is in the sensor frame, its distance to origin is its distance to the LiDAR
+        // Loop directly over the incoming frame, no intermediate downsampling needed
+        for (const auto& pt : frame->points) {
             float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-            if (dist_sq > max_range_sq_) {
-                continue; 
-            }
+            if (dist_sq > max_range_sq_) continue; 
 
             Eigen::Vector3f p(pt.x, pt.y, pt.z);
             Eigen::Vector3f p_world = transform * p;
             
-            // Calculate which 3D voxel this point belongs to
             Eigen::Vector3i voxel_idx(
                 std::floor(p_world.x() / leaf_size_),
                 std::floor(p_world.y() / leaf_size_),
@@ -141,10 +125,8 @@ public:
 
             auto it = voxel_map_.find(voxel_idx);
             if (it == voxel_map_.end()) {
-                // Voxel is empty! Add it with weight 1.0
                 voxel_map_[voxel_idx] = {p_world, pt.intensity, 1.0f};
             } else {
-                // Voxel exists! Perform the running weighted average
                 float w_old = it->second.weight;
                 float w_new = w_old + 1.0f;
                 
@@ -155,35 +137,53 @@ public:
         }
     }
 
-    // SLOW PATH: Wipe the hash map and rebuild from history
-    void construct(const std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr>& frames, 
-                   const std::vector<gtsam::Pose3>& poses) {
-        voxel_map_.clear();
-        for (size_t i = 0; i < frames.size(); ++i) {
-            update(frames[i], poses[i]);
+    void remove(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
+        Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
+        
+        // Loop directly over the incoming frame
+        for (const auto& pt : frame->points) {
+            float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+            if (dist_sq > max_range_sq_) continue; 
+
+            Eigen::Vector3f p(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_world = transform * p;
+            
+            Eigen::Vector3i voxel_idx(
+                std::floor(p_world.x() / leaf_size_),
+                std::floor(p_world.y() / leaf_size_),
+                std::floor(p_world.z() / leaf_size_)
+            );
+
+            auto it = voxel_map_.find(voxel_idx);
+            if (it != voxel_map_.end()) {
+                float w_old = it->second.weight;
+                float w_new = w_old - 1.0f;
+                
+                // If weight hits 0, erase the voxel entirely to save memory
+                if (w_new < 0.1f) {
+                    voxel_map_.erase(it);
+                } else {
+                    it->second.point = (it->second.point * w_old - p_world) / w_new;
+                    it->second.intensity = (it->second.intensity * w_old - pt.intensity) / w_new;
+                    it->second.weight = w_new;
+                }
+            }
         }
     }
 
-    // Convert the Hash Map back into a PCL PointCloud for ROS
     pcl::PointCloud<pcl::PointXYZI>::Ptr getMap() {
         pcl::PointCloud<pcl::PointXYZI>::Ptr out_cloud(new pcl::PointCloud<pcl::PointXYZI>());
         out_cloud->points.reserve(voxel_map_.size());
 
         for (const auto& kv : voxel_map_) {
-            // === NEW: MINIMUM WEIGHT FILTER ===
             if (kv.second.weight < min_weight_) {
                 continue; 
             }
-
             pcl::PointXYZI pt;
             pt.x = kv.second.point.x();
             pt.y = kv.second.point.y();
             pt.z = kv.second.point.z();
-            
-            // TRICK: We overwrite the "Intensity" field with the "Weight"!
-            // Map the Intensity channel in Foxglove to visualize point confidence/opacity.
             pt.intensity = kv.second.weight; 
-            
             out_cloud->push_back(pt);
         }
         
@@ -197,9 +197,8 @@ public:
 private:
     float leaf_size_;
     float max_range_sq_; 
-    float min_weight_; // NEW: Store the minimum weight to publish
+    float min_weight_; 
     std::unordered_map<Eigen::Vector3i, VoxelData, VoxelHash> voxel_map_;
-    pcl::VoxelGrid<pcl::PointXYZI> perFrameFilter_;
 };
 
 
@@ -478,12 +477,12 @@ private:
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
     std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
         
-    // PROFILE_BLOCK("scanMatching");
+    PROFILE_BLOCK("scanMatching");
     if (map.getKeyframes().size() == 0) {return;}
 
     const int maxIterations = 25;
     const float epsilon = 1e-5;
-    const float maxDistSq = 20.0;
+    const float maxDistSq = 10.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
 
@@ -632,7 +631,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
 class GlobalMapNode : public rclcpp::Node {
 public:
-    GlobalMapNode() : Node("global_map"), localMap(50){
+    GlobalMapNode() : Node("global_map"), localMap(25){
         // Threading and Safety setup
         imu_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         lidar_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -673,7 +672,7 @@ public:
         pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
 
         // TF2 Broadcaster
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        // tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         // Create the 1Hz Timer for the Global Map
         map_timer_ = this->create_wall_timer(
@@ -697,6 +696,8 @@ public:
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
         isam_ = std::make_unique<gtsam::ISAM2>(parameters);
+
+        loop_closure_filter_.setLeafSize(0.4f, 0.4f, 0.4f);
     }
 
 private:
@@ -709,12 +710,11 @@ private:
     std::mutex map_mutex_;
 
     // TF2 Broadcaster
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    // std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // Global Map State Tracking
     GlobalPointMap global_point_map_;
-    bool loop_closure_detected_ = false;
-    size_t last_processed_keyframe_ = 0;
+    std::vector<gtsam::Pose3> published_poses_; // NEW: Track exactly what the timer has already published
 
     // Subs and pubs
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subPoints_;
@@ -756,6 +756,8 @@ private:
 
     pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
 
+    pcl::VoxelGrid<pcl::PointXYZI> loop_closure_filter_;
+
     // Loop Closure Parameters
     double historySearchRadius_ = 15.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
@@ -770,7 +772,7 @@ private:
         LidarFrame LF = LidarFrame(*msg);
         LF.extract3DFeatures();
 
-        // Construct initial guess and do scan matching
+        // Construct initial transform guess and do scan matching
         const auto& keyframes = localMap.getKeyframes();
         Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
         if (!keyframes.empty()) {
@@ -796,11 +798,15 @@ private:
                     const auto& o = imu_odo_meas.pose.pose.orientation;
                     Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
 
+                    const auto& p = imu_odo_meas.pose.pose.position;
+
                     // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
                     currentTf.linear() = imu_quat.normalized().toRotationMatrix();
+                    currentTf.translation() = Eigen::Vector3f(p.x, p.y, p.z);
                 }
             }
 
+            // TODO: Can be removed for efficiency
             auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
                 (void)iter; // Fixes unused parameter warning
                 sensor_msgs::msg::PointCloud2 scanMsg;
@@ -844,7 +850,7 @@ private:
 
         // Add the current keyframe to the local map
         localMap.pushKeyframe({LF, currentTf});
-        // RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
+        RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
         publishLocalMap(msg->header.stamp);
 
@@ -854,20 +860,29 @@ private:
         // Detect Loop Closure
         detectLoopClosure(currentCloud);
 
-        // Optimize the factor graph
-        isam_->update(gtSAMgraph_, initialEstimate_);
-        isam_->update();
+        {
+            PROFILE_BLOCK("ISAM2_update_on_keyframe");
+            // Optimize the factor graph completely incrementally
+            isam_->update(gtSAMgraph_, initialEstimate_);
+            isam_->update();
 
-        // Clear graph and estimates for next iteration
-        gtSAMgraph_.resize(0);
-        initialEstimate_.clear();
+            // Clear graph and estimates for next iteration
+            gtSAMgraph_.resize(0);
+            initialEstimate_.clear();
 
-        // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
-        gtsam::Values currentEstimate = isam_->calculateEstimate();
-        cloudKeyPoses6D_.clear();
-        for (int i = 0; i < keyFrameID; ++i) {
-            cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
+            // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
+            gtsam::Values currentEstimate = isam_->calculateEstimate();
+            
+            {
+                // Lock while we safely update the ISAM2 corrected poses 
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                cloudKeyPoses6D_.clear();
+                for (int i = 0; i < keyFrameID; ++i) {
+                    cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
+                }
+            }
         }
+
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -904,13 +919,17 @@ private:
         keyFrameID++;
     }
 
+    /**
+     * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
+     */
     void detectLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud) {
-        // PROFILE_BLOCK("LoopClosures");
-        // @todo: Implement KD-Tree search on historical poses.
-        // If distance < threshold, perform ICP between current cloud and historical cloud.
-        // If ICP fitness score is good, add a gtsam::BetweenFactor to gtSAMgraph_.
+        
+        // === DOWNSAMPLE BEFORE SAVING ===
+        pcl::PointCloud<pcl::PointXYZI>::Ptr downsampledCloud(new pcl::PointCloud<pcl::PointXYZI>());
+        loop_closure_filter_.setInputCloud(currentCloud);
+        loop_closure_filter_.filter(*downsampledCloud);
 
-        // 1. Save the current pose and cloud into our history
+        // 1. Save the downsampled pose and cloud into our history
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             pcl::PointXYZ currentPose3D;
@@ -919,21 +938,23 @@ private:
             currentPose3D.z = currentPoseEstimate.translation().z();
             cloudKeyPoses3D_->push_back(currentPose3D);
             cloudKeyPoses6D_.push_back(currentPoseEstimate);
-            cloudKeyframes_.push_back(currentCloud);
+            
+            // Push the lightweight cloud, not the heavy one!
+            cloudKeyframes_.push_back(downsampledCloud); 
         }
 
-        // Add return to visualize global map without loop closure
-        // return;
+        // uncomment to stop Loop closure to run AND not add linear factors between poses from LO
+        return;
 
         int currentID = cloudKeyPoses3D_->size() - 1;
 
-        // We need a minimum amount of history to even attempt a loop closure
         if (currentID < historySearchTimeDiff_) {
             RCLCPP_DEBUG(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", currentID, historySearchTimeDiff_);
             return;
         }
 
-        // Build the KD-Tree using our trajectory
+        // 2. Build the KD-Tree using our trajectory
+        // TODO: Check if cloudKeyPoses3D_ is being updated before KDTree
         kdtreeHistoryKeyPoses_->setInputCloud(cloudKeyPoses3D_);
 
         std::vector<int> pointSearchInd;
@@ -959,66 +980,60 @@ private:
             return;
         }
 
-        // Verification: Run ICP between current cloud and historical cloud
-        pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
-        icp.setMaxCorrespondenceDistance(1.5); // Max distance to associate points
-        icp.setMaximumIterations(100);
-        icp.setTransformationEpsilon(1e-6);
-        icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setInputSource(currentCloud);
-        icp.setInputTarget(cloudKeyframes_[loopMatchID]);
-
-        // Current pose estimate wrt map frame
-        gtsam::Pose3 pCurrent = currentPoseEstimate;
-
-        // Previou pose estimate wrt map frame
-        gtsam::Values estimate = isam_->calculateEstimate();
-        gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
-
-        // Initial guess for transform between current and previous point clouds
-        Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
-
-        // Run ICP
-        pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
-        icp.align(*unused_result, initialGuess);
-
-        // Evaluate and Add to Graph
-        if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
-            RCLCPP_DEBUG(this->get_logger(), "Loop closure rejected. Fitness: %f", icp.getFitnessScore());
-            return;
-        }
-
-        RCLCPP_INFO(this->get_logger(), "LOOP CLOSURE DETECTED! Frame %d -> Frame %d. Fitness: %f",
-                    currentID, loopMatchID, icp.getFitnessScore());
-
-        // Extract the transformation matrix calculated by ICP
-        Eigen::Matrix4f icpTransform = icp.getFinalTransformation();
-
-        // Convert to GTSAM Pose3
-        gtsam::Rot3 rot(icpTransform.block<3,3>(0,0).cast<double>());
-        gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
-        gtsam::Pose3 loopPose(rot, trans);
-
-        // Add Loop Closure Factor to the Graph
-        // Note: Loop closures usually get a slightly less confident noise model than consecutive odometry
-        gtsam::Vector6 loopSigmas;
-        loopSigmas << 0.1, 0.1, 0.1, 0.2, 0.2, 0.2;
-        auto loopNoise = gtsam::noiseModel::Diagonal::Sigmas(loopSigmas);
-
-        gtsam::Symbol currentKey('X', currentID);
-        gtsam::Symbol historicalKey('X', loopMatchID);
-
-        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            historicalKey, currentKey, loopPose, loopNoise));
-            
+        // 5. Verification: Run ICP between current cloud and historical cloud
         {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            loop_closure_detected_ = true;
+            PROFILE_BLOCK("Global_map_icp");
+            pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
+            icp.setMaxCorrespondenceDistance(1.5); 
+            icp.setMaximumIterations(100);
+            icp.setTransformationEpsilon(1e-6);
+            icp.setEuclideanFitnessEpsilon(1e-6);
+            
+            // === USE THE LIGHTWEIGHT CLOUD FOR ICP ===
+            icp.setInputSource(downsampledCloud);
+            icp.setInputTarget(cloudKeyframes_[loopMatchID]);
+            
+            // TODO: Does calculateEstimate() run optimization under the hood?
+            // One between factor has already been added. Maybe that is why we are optimizing
+            gtsam::Values estimate = isam_->calculateEstimate();
+            gtsam::Pose3 pCurrent = currentPoseEstimate;
+            gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
+
+            // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely) 
+            Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
+            pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
+            icp.align(*unused_result, initialGuess);
+
+            if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
+
+                return;
+            }
+
+            RCLCPP_INFO(this->get_logger(), "LOOP CLOSURE DETECTED! Frame %d -> Frame %d. Fitness: %f",
+                        currentID, loopMatchID, icp.getFitnessScore());
+
+            Eigen::Matrix4f icpTransform = icp.getFinalTransformation();
+
+            gtsam::Rot3 rot(icpTransform.block<3,3>(0,0).cast<double>());
+            gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
+            gtsam::Pose3 loopPose(rot, trans);
+
+            // TODO: Tune covariances if needed
+            gtsam::Vector6 loopSigmas;
+            loopSigmas << 0.1, 0.1, 0.1, 0.2, 0.2, 0.2;
+            auto loopNoise = gtsam::noiseModel::Diagonal::Sigmas(loopSigmas);
+
+            gtsam::Symbol currentKey('X', currentID);
+            gtsam::Symbol historicalKey('X', loopMatchID);
+
+            gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                historicalKey, currentKey, loopPose, loopNoise));
+                
+            // No more loop closure boolean required! The incremental solver handles it.
         }
     }
 
     void publishLocalMap(const rclcpp::Time& timestamp) {
-        // PROFILE_BLOCK("publishLocalMap");
         sensor_msgs::msg::PointCloud2 cloudMsg;
         pcl::toROSMsg(localMap.getVoxels(), cloudMsg);
         cloudMsg.header.stamp = timestamp;
@@ -1027,11 +1042,10 @@ private:
     }
 
     void publishGlobalMap(const rclcpp::Time& timestamp) {
-        // PROFILE_BLOCK("publishGlobalMap");
+        PROFILE_BLOCK("publishGlobalMap");
         
         std::vector<gtsam::Pose3> poses_copy;
         std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
-        bool reconstruct_map = false;
 
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
@@ -1039,23 +1053,26 @@ private:
             
             poses_copy = cloudKeyPoses6D_;
             frames_copy = cloudKeyframes_;
-            
-            if (loop_closure_detected_) {
-                reconstruct_map = true;
-                loop_closure_detected_ = false; 
-            }
         }
 
-        if (reconstruct_map) {
-            // PROFILE_BLOCK("GlobalMap_Construct_Slow_Path");
-            global_point_map_.construct(frames_copy, poses_copy);
-            last_processed_keyframe_ = frames_copy.size();
-        } else {
-            // PROFILE_BLOCK("GlobalMap_Update_Fast_Path");
-            for (size_t i = last_processed_keyframe_; i < frames_copy.size(); ++i) {
+        // TODO: Check what happens when cloudKeyPoses gets new memory allocated because size == capacity
+        // Compare the local Map Thread state to the master ISAM2 state
+        for (size_t i = 0; i < poses_copy.size(); ++i) {
+            if (i >= published_poses_.size()) {
+                // 1. BRAND NEW FRAME: Fast Path Append
                 global_point_map_.update(frames_copy[i], poses_copy[i]);
+                published_poses_.push_back(poses_copy[i]);
+            } else {
+                // 2. EXISTING FRAME: Did ISAM2 move it incrementally?
+                if (!published_poses_[i].equals(poses_copy[i], 1e-4)) { 
+                    // Rollback the old voxel merge
+                    global_point_map_.remove(frames_copy[i], published_poses_[i]);
+                    // Apply the new corrected ISAM2 pose
+                    global_point_map_.update(frames_copy[i], poses_copy[i]);
+                    // Update our cache
+                    published_poses_[i] = poses_copy[i];
+                }
             }
-            last_processed_keyframe_ = frames_copy.size();
         }
 
         pcl::PointCloud<pcl::PointXYZI>::Ptr map_to_publish = global_point_map_.getMap();
@@ -1084,18 +1101,18 @@ private:
         pubIncrementalOdom_->publish(odomMsg);
 
         // 2. Broadcast the TF Frame so you can see the robot model in RViz/Foxglove
-        geometry_msgs::msg::TransformStamped t;
-        t.header.stamp = timestamp;
-        t.header.frame_id = "map";
-        t.child_frame_id = "velodyne"; // This should match your robot's base or lidar frame
-        t.transform.translation.x = currentTf.translation().x();
-        t.transform.translation.y = currentTf.translation().y();
-        t.transform.translation.z = currentTf.translation().z();
-        t.transform.rotation.x = q.x();
-        t.transform.rotation.y = q.y();
-        t.transform.rotation.z = q.z();
-        t.transform.rotation.w = q.w();
-        tf_broadcaster_->sendTransform(t);
+        // geometry_msgs::msg::TransformStamped t;
+        // t.header.stamp = timestamp;
+        // t.header.frame_id = "map";
+        // t.child_frame_id = "velodyne"; // This should match your robot's base or lidar frame
+        // t.transform.translation.x = currentTf.translation().x();
+        // t.transform.translation.y = currentTf.translation().y();
+        // t.transform.translation.z = currentTf.translation().z();
+        // t.transform.rotation.x = q.x();
+        // t.transform.rotation.y = q.y();
+        // t.transform.rotation.z = q.z();
+        // t.transform.rotation.w = q.w();
+        // tf_broadcaster_->sendTransform(t);
     }
 
     void publishGlobalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
