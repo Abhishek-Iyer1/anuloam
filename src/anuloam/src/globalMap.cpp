@@ -2,6 +2,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -28,6 +30,7 @@
 
 #include <Eigen/Geometry>
 
+#include <unordered_map>
 #include <chrono> 
 #include <mutex> 
 #include "utils.hpp"
@@ -74,6 +77,130 @@ struct PointRoughness {
     float roughness;
 };
 
+
+// Custom hash function for Eigen::Vector3i so we can use it in a std::unordered_map
+struct VoxelHash {
+    size_t operator()(const Eigen::Vector3i& voxel) const {
+        const size_t p1 = 73856093;
+        const size_t p2 = 19349663;
+        const size_t p3 = 83492791;
+        return (voxel.x() * p1) ^ (voxel.y() * p2) ^ (voxel.z() * p3);
+    }
+};
+
+struct VoxelData {
+    Eigen::Vector3f point;
+    float intensity;
+    float weight;
+};
+
+/**
+ * @brief Stateful Voxel Hash Map. 
+ * Performs O(1) weighted running averages (merges) for the Global Map visualization.
+ */
+class GlobalPointMap {
+public:
+    // Added min_weight threshold. 2.0f means a point must be seen at least twice.
+    GlobalPointMap(float leaf_size = 0.4f, float max_range = 30.0f, float min_weight = 5.0f) 
+        : leaf_size_(leaf_size), max_range_sq_(max_range * max_range), min_weight_(min_weight) {
+        voxel_map_.reserve(100000); 
+        // We set the pre-filter leaf size to match the hash map. 
+        // This ensures we only do ~1 hash lookup per voxel per incoming frame.
+        perFrameFilter_.setLeafSize(leaf_size_, leaf_size_, leaf_size_); 
+    }
+
+    // FAST PATH: Downsample, Hash, and Merge points using a weighted average
+    void update(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
+        
+        // 1. Downsample the incoming cloud FIRST to save computation
+        pcl::PointCloud<pcl::PointXYZI>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZI>());
+        perFrameFilter_.setInputCloud(frame);
+        perFrameFilter_.filter(*downsampled);
+
+        Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
+        
+        // 2. Transform and Merge the downsampled points
+        for (const auto& pt : downsampled->points) {
+            
+            // MAX RANGE FILTER
+            // Since pt is in the sensor frame, its distance to origin is its distance to the LiDAR
+            float dist_sq = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+            if (dist_sq > max_range_sq_) {
+                continue; 
+            }
+
+            Eigen::Vector3f p(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_world = transform * p;
+            
+            // Calculate which 3D voxel this point belongs to
+            Eigen::Vector3i voxel_idx(
+                std::floor(p_world.x() / leaf_size_),
+                std::floor(p_world.y() / leaf_size_),
+                std::floor(p_world.z() / leaf_size_)
+            );
+
+            auto it = voxel_map_.find(voxel_idx);
+            if (it == voxel_map_.end()) {
+                // Voxel is empty! Add it with weight 1.0
+                voxel_map_[voxel_idx] = {p_world, pt.intensity, 1.0f};
+            } else {
+                // Voxel exists! Perform the running weighted average
+                float w_old = it->second.weight;
+                float w_new = w_old + 1.0f;
+                
+                it->second.point = (it->second.point * w_old + p_world) / w_new;
+                it->second.intensity = (it->second.intensity * w_old + pt.intensity) / w_new;
+                it->second.weight = w_new;
+            }
+        }
+    }
+
+    // SLOW PATH: Wipe the hash map and rebuild from history
+    void construct(const std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr>& frames, 
+                   const std::vector<gtsam::Pose3>& poses) {
+        voxel_map_.clear();
+        for (size_t i = 0; i < frames.size(); ++i) {
+            update(frames[i], poses[i]);
+        }
+    }
+
+    // Convert the Hash Map back into a PCL PointCloud for ROS
+    pcl::PointCloud<pcl::PointXYZI>::Ptr getMap() {
+        pcl::PointCloud<pcl::PointXYZI>::Ptr out_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+        out_cloud->points.reserve(voxel_map_.size());
+
+        for (const auto& kv : voxel_map_) {
+            // === NEW: MINIMUM WEIGHT FILTER ===
+            if (kv.second.weight < min_weight_) {
+                continue; 
+            }
+
+            pcl::PointXYZI pt;
+            pt.x = kv.second.point.x();
+            pt.y = kv.second.point.y();
+            pt.z = kv.second.point.z();
+            
+            // TRICK: We overwrite the "Intensity" field with the "Weight"!
+            // Map the Intensity channel in Foxglove to visualize point confidence/opacity.
+            pt.intensity = kv.second.weight; 
+            
+            out_cloud->push_back(pt);
+        }
+        
+        out_cloud->width = out_cloud->points.size();
+        out_cloud->height = 1;
+        out_cloud->is_dense = true;
+        
+        return out_cloud;
+    }
+
+private:
+    float leaf_size_;
+    float max_range_sq_; 
+    float min_weight_; // NEW: Store the minimum weight to publish
+    std::unordered_map<Eigen::Vector3i, VoxelData, VoxelHash> voxel_map_;
+    pcl::VoxelGrid<pcl::PointXYZI> perFrameFilter_;
+};
 
 
 /**
@@ -142,19 +269,15 @@ public:
 
         // TODO: could be multi-threaded since each thread only has read access and needs to store the roughness
         size_t scanSize = ring.size();
-        size_t numSections = 8;
-        size_t edgeFeaturesPerSection = 2;
-        size_t planarFeaturesPerSection = 4;
+        size_t numSections = 6;
+        size_t edgeFeaturesPerSection = 1;
+        size_t planarFeaturesPerSection = 3;
 
         // Add 2 edge and 4 planar features per section to LidarFrames
         for (size_t section=1; section <= numSections; section++) {
 
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
-            // size_t currentFeatures = 0;
-            // size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
-
-            // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
 
             std::vector<PointRoughness> roughnesses;
             roughnesses.reserve(endInd - startInd);
@@ -355,12 +478,12 @@ private:
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
     std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
         
-    PROFILE_BLOCK("scanMatching");
+    // PROFILE_BLOCK("scanMatching");
     if (map.getKeyframes().size() == 0) {return;}
 
-    const int maxIterations = 50;
+    const int maxIterations = 25;
     const float epsilon = 1e-5;
-    const float maxDistSq = 1.0;
+    const float maxDistSq = 20.0;
 
     for (int iter = 0; iter < maxIterations; ++iter) {
 
@@ -467,9 +590,6 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             }
         }
 
-        // std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n",
-        //             iter, edgeCount, edgeLoss, patchCount, patchLoss, (edgeLoss + patchLoss));
-
         if (iterCallback) {
             pcl::PointCloud<PointXYZIR> currentAligned;
             pcl::transformPointCloud(target.getFeatures(), currentAligned, currentGuess.matrix());
@@ -552,6 +672,9 @@ public:
         pubTest_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
         pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
 
+        // TF2 Broadcaster
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
         // Create the 1Hz Timer for the Global Map
         map_timer_ = this->create_wall_timer(
             std::chrono::seconds(1),
@@ -584,6 +707,14 @@ private:
     rclcpp::TimerBase::SharedPtr map_timer_;
     std::mutex imu_mutex_;
     std::mutex map_mutex_;
+
+    // TF2 Broadcaster
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    // Global Map State Tracking
+    GlobalPointMap global_point_map_;
+    bool loop_closure_detected_ = false;
+    size_t last_processed_keyframe_ = 0;
 
     // Subs and pubs
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subPoints_;
@@ -631,7 +762,7 @@ private:
     double icpFitnessThreshold_ = 0.3;  // Lower is better
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-        PROFILE_BLOCK("PointCloud_Callback");
+        // PROFILE_BLOCK("PointCloud_Callback");
         // Convert ROS -> PCL
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
@@ -713,7 +844,7 @@ private:
 
         // Add the current keyframe to the local map
         localMap.pushKeyframe({LF, currentTf});
-        RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
+        // RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
         publishLocalMap(msg->header.stamp);
 
@@ -737,9 +868,6 @@ private:
         for (int i = 0; i < keyFrameID; ++i) {
             cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
         }
-
-        // REMOVED: publishGlobalMap(msg->header.stamp); 
-        // (This is now handled by the 1Hz Timer!)
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -752,7 +880,7 @@ private:
     }
 
     void updateGraph(const gtsam::Pose3& odomStep) {
-        PROFILE_BLOCK("Update_Graph");
+        // PROFILE_BLOCK("Update_Graph");
         gtsam::Symbol currentKey('X', keyFrameID);
 
         // Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
@@ -777,13 +905,12 @@ private:
     }
 
     void detectLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud) {
-        PROFILE_BLOCK("LoopClosures");
+        // PROFILE_BLOCK("LoopClosures");
         // @todo: Implement KD-Tree search on historical poses.
         // If distance < threshold, perform ICP between current cloud and historical cloud.
         // If ICP fitness score is good, add a gtsam::BetweenFactor to gtSAMgraph_.
 
         // 1. Save the current pose and cloud into our history
-        // LOCK THE MAP VECTOR WHILE WE ADD TO IT
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             pcl::PointXYZ currentPose3D;
@@ -883,10 +1010,15 @@ private:
 
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
             historicalKey, currentKey, loopPose, loopNoise));
+            
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            loop_closure_detected_ = true;
+        }
     }
 
     void publishLocalMap(const rclcpp::Time& timestamp) {
-        PROFILE_BLOCK("publishLocalMap");
+        // PROFILE_BLOCK("publishLocalMap");
         sensor_msgs::msg::PointCloud2 cloudMsg;
         pcl::toROSMsg(localMap.getVoxels(), cloudMsg);
         cloudMsg.header.stamp = timestamp;
@@ -895,47 +1027,48 @@ private:
     }
 
     void publishGlobalMap(const rclcpp::Time& timestamp) {
-        PROFILE_BLOCK("publishGlobalMap");
+        // PROFILE_BLOCK("publishGlobalMap");
         
-        // Lock and copy so the timer thread doesn't crash when LiDAR thread adds a new frame
         std::vector<gtsam::Pose3> poses_copy;
         std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
+        bool reconstruct_map = false;
+
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (cloudKeyframes_.empty()) return;
+            
             poses_copy = cloudKeyPoses6D_;
             frames_copy = cloudKeyframes_;
+            
+            if (loop_closure_detected_) {
+                reconstruct_map = true;
+                loop_closure_detected_ = false; 
+            }
         }
 
-        pcl::VoxelGrid<pcl::PointXYZI> perFrameFilter;
-        perFrameFilter.setLeafSize(0.2f, 0.2f, 0.2f);
-
-        pcl::PointCloud<pcl::PointXYZI> globalCloud;
-        for (size_t i = 0; i < frames_copy.size(); ++i) {
-            pcl::PointCloud<pcl::PointXYZI> downsampled;
-            perFrameFilter.setInputCloud(frames_copy[i]);
-            perFrameFilter.filter(downsampled);
-
-            pcl::PointCloud<pcl::PointXYZI> transformed;
-            Eigen::Isometry3f pose = pose3ToEigenIsometry(poses_copy[i]);
-            pcl::transformPointCloud(downsampled, transformed, pose.matrix());
-            globalCloud += transformed;
+        if (reconstruct_map) {
+            // PROFILE_BLOCK("GlobalMap_Construct_Slow_Path");
+            global_point_map_.construct(frames_copy, poses_copy);
+            last_processed_keyframe_ = frames_copy.size();
+        } else {
+            // PROFILE_BLOCK("GlobalMap_Update_Fast_Path");
+            for (size_t i = last_processed_keyframe_; i < frames_copy.size(); ++i) {
+                global_point_map_.update(frames_copy[i], poses_copy[i]);
+            }
+            last_processed_keyframe_ = frames_copy.size();
         }
 
-        pcl::PointCloud<pcl::PointXYZI> filtered;
-        pcl::VoxelGrid<pcl::PointXYZI> vf;
-        vf.setLeafSize(0.4f, 0.4f, 0.4f);
-        vf.setInputCloud(globalCloud.makeShared());
-        vf.filter(filtered);
+        pcl::PointCloud<pcl::PointXYZI>::Ptr map_to_publish = global_point_map_.getMap();
 
         sensor_msgs::msg::PointCloud2 cloudMsg;
-        pcl::toROSMsg(filtered, cloudMsg);
+        pcl::toROSMsg(*map_to_publish, cloudMsg); // This will take a few ms
         cloudMsg.header.stamp = timestamp;
         cloudMsg.header.frame_id = "map";
         pubGlobalMap_->publish(cloudMsg);
     }
 
     void publishIncrementalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
+        // 1. Publish the Odom Message
         nav_msgs::msg::Odometry odomMsg;
         odomMsg.header.stamp = timestamp;
         odomMsg.header.frame_id = "map";
@@ -949,6 +1082,20 @@ private:
         odomMsg.pose.pose.orientation.z = q.z();
         odomMsg.pose.pose.orientation.w = q.w();
         pubIncrementalOdom_->publish(odomMsg);
+
+        // 2. Broadcast the TF Frame so you can see the robot model in RViz/Foxglove
+        geometry_msgs::msg::TransformStamped t;
+        t.header.stamp = timestamp;
+        t.header.frame_id = "map";
+        t.child_frame_id = "velodyne"; // This should match your robot's base or lidar frame
+        t.transform.translation.x = currentTf.translation().x();
+        t.transform.translation.y = currentTf.translation().y();
+        t.transform.translation.z = currentTf.translation().z();
+        t.transform.rotation.x = q.x();
+        t.transform.rotation.y = q.y();
+        t.transform.rotation.z = q.z();
+        t.transform.rotation.w = q.w();
+        tf_broadcaster_->sendTransform(t);
     }
 
     void publishGlobalOdometry(const Eigen::Isometry3f& currentTf, const rclcpp::Time& timestamp) {
