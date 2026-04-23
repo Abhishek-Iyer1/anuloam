@@ -775,85 +775,28 @@ private:
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
 
+        // Convert PCL to LidarFrame and extract 3D features
         LidarFrame LF = LidarFrame(*msg);
         LF.extract3DFeatures();
 
-        // Construct initial transform guess and do scan matching
-        const auto& keyframes = localMap.getKeyframes();
+        // Construct initial transform guess
         Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
-        if (!keyframes.empty()) {
-            double cloud_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-            currentTf = keyframes.back().second;
+        Eigen::Isometry3f delta = Eigen::Isometry3f::Identity();
+        double cloudTime = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+        calculateInitialTransformGuess(localMap, currentTf, cloudTime);
 
-            // Use IMU orientation if available for the guess
-            {
-                std::lock_guard<std::mutex> lock(imu_mutex_);
-                if (!imu_q_.empty()) {
-                    nav_msgs::msg::Odometry imu_odo_meas;
-                    // TODO manage q with lock
-                    while (!imu_q_.empty()) {
-                        imu_odo_meas = imu_q_.front();
-                        double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
-                        if (imu_time > cloud_time) {
-                            break;
-                        }
-                        imu_q_.pop_front();
-                    }
-
-                    // Extract the orientation from the IMU message
-                    const auto& o = imu_odo_meas.pose.pose.orientation;
-                    Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
-
-                    const auto& p = imu_odo_meas.pose.pose.position;
-
-                    // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
-                    currentTf.linear() = imu_quat.normalized().toRotationMatrix();
-                    currentTf.translation() = Eigen::Vector3f(p.x, p.y, p.z);
-                }
-            }
-
-            // TODO: Can be removed for efficiency
-            auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
-                (void)iter; // Fixes unused parameter warning
-                sensor_msgs::msg::PointCloud2 scanMsg;
-                pcl::toROSMsg(alignedCloud, scanMsg);
-                scanMsg.header = msg->header;
-                scanMsg.header.frame_id = "map";
-                pubTest_->publish(scanMsg);
-            };
-
-            scanMatching(localMap, LF, currentTf, visualizeIter);
-        }
+        // Perform scan matching
+        performScanMatching(localMap, LF, currentTf, delta, msg);
 
         // Publish whatever scan matching gives as the continuous odometry
         publishIncrementalOdometry(currentTf, msg->header.stamp);
 
-        // Add a check for if tf greater than some threshold. If so add it as a keyframe
-        bool should_add_keyframe = false;
-        Eigen::Isometry3f delta = Eigen::Isometry3f::Identity();
-        if (keyframes.size() == 0) {
-            should_add_keyframe = true;
-        } else {
-            size_t last_idx = keyframes.size() - 1;
-            Eigen::Isometry3f last_pose = keyframes[last_idx].second;
-
-            delta = last_pose.inverse() * currentTf;
-
-            float translation_diff = delta.translation().norm();
-            float rotation_diff = std::abs(Eigen::AngleAxisf(delta.rotation()).angle());
-
-            // Thresholds: 0.5 meters or ~5.7 degrees (0.1 radians)
-            if (translation_diff > 0.5f || rotation_diff > 0.1f) {
-                should_add_keyframe = true;
-            }
-        }
-
-        if (!should_add_keyframe) {
+        // Check if the current frame is a keyframe
+        if(!isKeyframe(delta)) {
             return;
         }
 
         // Add the current keyframe to the local map and global map
-        keyLidarFrames_.push_back(LF);
         localMap.pushKeyframe({LF, currentTf});
         RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
@@ -889,6 +832,78 @@ private:
 
     void globalMapTimerCallback() {
         publishGlobalMap(this->now());
+    }
+
+    void calculateInitialTransformGuess(const LocalMap& localMap, Eigen::Isometry3f& currentTf, double cloudTime) {
+        if (keyFrameID == 0) {
+            currentTf = Eigen::Isometry3f::Identity();
+            return;
+        }
+
+        const auto& keyframes = localMap.getKeyframes();
+        currentTf = keyframes.back().second;
+        {
+            std::lock_guard<std::mutex> lock(imu_mutex_);
+            if (!imu_q_.empty()) {
+                nav_msgs::msg::Odometry imu_odo_meas;
+                // TODO manage q with lock
+                while (!imu_q_.empty()) {
+                    imu_odo_meas = imu_q_.front();
+                    double imu_time = imu_odo_meas.header.stamp.sec + imu_odo_meas.header.stamp.nanosec * 1e-9;
+                    if (imu_time > cloudTime) {
+                        break;
+                    }
+                    imu_q_.pop_front();
+                }
+
+                // Extract the orientation from the IMU message
+                const auto& o = imu_odo_meas.pose.pose.orientation;
+                Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
+
+                const auto& p = imu_odo_meas.pose.pose.position;
+
+                // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
+                currentTf.linear() = imu_quat.normalized().toRotationMatrix();
+                currentTf.translation() = Eigen::Vector3f(p.x, p.y, p.z);
+            }
+        }
+    }
+
+    void performScanMatching(const LocalMap& localMap, LidarFrame& LF, Eigen::Isometry3f& currentGuess, Eigen::Isometry3f& delta, const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        // Handle first keyframe
+        if(keyFrameID == 0) {
+            currentGuess = Eigen::Isometry3f::Identity();
+            delta = Eigen::Isometry3f::Identity();
+            return;
+        }
+
+        auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
+            (void)iter; // Fixes unused parameter warning
+            sensor_msgs::msg::PointCloud2 scanMsg;
+            pcl::toROSMsg(alignedCloud, scanMsg);
+            scanMsg.header = msg->header;
+            scanMsg.header.frame_id = "map";
+            pubTest_->publish(scanMsg);
+        };
+
+        // Refine current guess using scan matching
+        scanMatching(localMap, LF, currentGuess, visualizeIter);
+
+        // Calculate the delta between last keyframe and the current keyframe
+        const auto& keyframes = localMap.getKeyframes();
+        size_t last_idx = keyframes.size() - 1;
+        Eigen::Isometry3f last_pose = keyframes[last_idx].second;
+        delta = last_pose.inverse() * currentGuess;
+    }
+
+    bool isKeyframe(const Eigen::Isometry3f& delta) {
+        if(keyFrameID == 0) {
+            return true;
+        }
+
+        bool validRotation = std::abs(Eigen::AngleAxisf(delta.rotation()).angle()) > keyframeRotationThresh_;
+        bool validTranslation = delta.translation().norm() > keyframeTranslationThresh_;
+        return validRotation || validTranslation;
     }
 
     void expandGlobalPointCloudsAndPoses(
@@ -1061,7 +1076,7 @@ private:
             std::lock_guard<std::mutex> lock(map_mutex_);
             cloudKeyPoses6D_.clear();
             cloudKeyPoses3D_->clear();
-            for (int i = 0; i < keyFrameID; ++i) {
+            for (int i = 0; i <= keyFrameID; ++i) {
                 cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
                 cloudKeyPoses3D_->push_back(pcl::PointXYZ(cloudKeyPoses6D_[i].translation().x(), cloudKeyPoses6D_[i].translation().y(), cloudKeyPoses6D_[i].translation().z()));
             }
