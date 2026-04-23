@@ -753,7 +753,6 @@ private:
     gtsam::Values initialEstimate_;
 
     // Keyframe variables
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudKeyPoses3D_{new pcl::PointCloud<pcl::PointXYZ>()};
     std::vector<gtsam::Pose3> cloudKeyPoses6D_;
 
     std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> cloudKeyframes_;
@@ -770,7 +769,8 @@ private:
     double icpFitnessThreshold_ = 0.3;  // Lower is better
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-        // PROFILE_BLOCK("PointCloud_Callback");
+        auto cb_start = std::chrono::high_resolution_clock::now();
+
         // Convert ROS -> PCL
         pcl::PointCloud<pcl::PointXYZI>::Ptr currentCloud(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*msg, *currentCloud);
@@ -793,16 +793,18 @@ private:
 
         // Check if the current frame is a keyframe
         if(!isKeyframe(delta)) {
+            double cb_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - cb_start).count();
+            RCLCPP_WARN(this->get_logger(), ">>> pointCloudCallback (no keyframe): %.2f ms <<<", cb_ms);
             return;
         }
 
         // Add the current keyframe to the local map and global map
         localMap.pushKeyframe({LF, currentTf});
-        RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
+        // RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
         publishLocalMap(msg->header.stamp);
 
-        // Update current pose estimate
+        // Update current pose estimate. This is global estimate, affected by loop closure
         currentPoseEstimate = currentPoseEstimate.compose(eigenIsometryToPose3(delta));
 
         // Update global point clouds and poses
@@ -823,6 +825,9 @@ private:
 
         // Update key frame ID (to be used for next keyframe)
         keyFrameID++;
+
+        double cb_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - cb_start).count();
+        RCLCPP_WARN(this->get_logger(), ">>> pointCloudCallback (keyframe %d): %.2f ms <<<", keyFrameID, cb_ms);
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -918,11 +923,6 @@ private:
         // Save the downsampled pose and cloud into our history
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            pcl::PointXYZ currentPose3D;
-            currentPose3D.x = currentPose.translation().x();
-            currentPose3D.y = currentPose.translation().y();
-            currentPose3D.z = currentPose.translation().z();
-            cloudKeyPoses3D_->push_back(currentPose3D);
             cloudKeyPoses6D_.push_back(currentPose);
 
             // Push the lightweight cloud, not the heavy one!
@@ -931,6 +931,7 @@ private:
 
         // Update global key lidar frames
         keyLidarFrames_.push_back(LF);
+        RCLCPP_INFO(this->get_logger(), "Added Global Keyframe. keyLidarFrames_ size: %zu", keyLidarFrames_.size());
     }
 
     void addAdjacentFactor(const gtsam::Pose3& odomStep) {
@@ -955,9 +956,17 @@ private:
     }
 
     int findLoopMatchID() {
-        // Build the KD-Tree using our trajectory
-        // TODO: Check if cloudKeyPoses3D_ is being updated before KDTree
-        kdtreeHistoryKeyPoses_->setInputCloud(cloudKeyPoses3D_);
+        // Build a temporary position cloud from the 6D poses
+        pcl::PointCloud<pcl::PointXYZ>::Ptr posCloud(new pcl::PointCloud<pcl::PointXYZ>());
+        posCloud->reserve(cloudKeyPoses6D_.size());
+        for (const auto& pose : cloudKeyPoses6D_) {
+            posCloud->push_back(pcl::PointXYZ(
+                pose.translation().x(),
+                pose.translation().y(),
+                pose.translation().z()
+            ));
+        }
+        kdtreeHistoryKeyPoses_->setInputCloud(posCloud);
 
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
@@ -1075,10 +1084,8 @@ private:
             // Lock while we safely update the ISAM2 corrected poses
             std::lock_guard<std::mutex> lock(map_mutex_);
             cloudKeyPoses6D_.clear();
-            cloudKeyPoses3D_->clear();
             for (int i = 0; i <= keyFrameID; ++i) {
                 cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
-                cloudKeyPoses3D_->push_back(pcl::PointXYZ(cloudKeyPoses6D_[i].translation().x(), cloudKeyPoses6D_[i].translation().y(), cloudKeyPoses6D_[i].translation().z()));
             }
         }
     }
