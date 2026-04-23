@@ -684,12 +684,16 @@ public:
 
         // Noise models (Covariances)
         gtsam::Vector6 prior_sigmas;
-        prior_sigmas << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2; // @todo: Update these values
+        prior_sigmas << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2; // TODO: Update these values
         prior_noise_ = gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas);
 
         gtsam::Vector6 odom_sigmas;
-        odom_sigmas << 1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1; // @todo: Update these values
+        odom_sigmas << 1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1; // TODO: Update these values
         odom_noise_ = gtsam::noiseModel::Diagonal::Sigmas(odom_sigmas);
+
+        gtsam::Vector6 loopSigmas;
+        loopSigmas << 0.1, 0.1, 0.1, 0.2, 0.2, 0.2; // TODO: Update these values
+        loop_noise_ = gtsam::noiseModel::Diagonal::Sigmas(loopSigmas);
 
         // Initialize the ISAM2 Optimizer
         gtsam::ISAM2Params parameters;
@@ -741,6 +745,7 @@ private:
     // Noise models (Covariances)
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr odom_noise_;
+    gtsam::noiseModel::Diagonal::shared_ptr loop_noise_;
 
     // GTSAM backend variables
     std::unique_ptr<gtsam::ISAM2> isam_;
@@ -752,6 +757,7 @@ private:
     std::vector<gtsam::Pose3> cloudKeyPoses6D_;
 
     std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> cloudKeyframes_;
+    std::vector<LidarFrame> keyLidarFrames_;
 
 
     pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
@@ -846,41 +852,34 @@ private:
             return;
         }
 
-        // Add the current keyframe to the local map
+        // Add the current keyframe to the local map and global map
+        keyLidarFrames_.push_back(LF);
         localMap.pushKeyframe({LF, currentTf});
         RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
         publishLocalMap(msg->header.stamp);
 
+        // Update current pose estimate
+        currentPoseEstimate = currentPoseEstimate.compose(eigenIsometryToPose3(delta));
+
+        // Update global point clouds and poses
+        pcl::PointCloud<pcl::PointXYZI>::Ptr downsampledCloud(new pcl::PointCloud<pcl::PointXYZI>());
+        expandGlobalPointCloudsAndPoses(currentCloud, downsampledCloud, currentPoseEstimate, LF);
+
         // Update Factor Graph with the pose
-        updateGraph(eigenIsometryToPose3(delta));
+        addAdjacentFactor(eigenIsometryToPose3(delta));
 
-        // Detect Loop Closure
-        detectLoopClosure(currentCloud);
+        // Attempt Loop Closure
+        attemptLoopClosure(downsampledCloud);
 
-        {
-            PROFILE_BLOCK("ISAM2_update_on_keyframe");
-            // Optimize the factor graph completely incrementally
-            isam_->update(gtSAMgraph_, initialEstimate_);
-            isam_->update();
+        optimizeFactorGraph();
 
-            // Clear graph and estimates for next iteration
-            gtSAMgraph_.resize(0);
-            initialEstimate_.clear();
+        updateGlobalPoses();
 
-            // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
-            gtsam::Values currentEstimate = isam_->calculateEstimate();
+        publishGlobalOdometry(currentTf, msg->header.stamp);
 
-            {
-                // Lock while we safely update the ISAM2 corrected poses
-                std::lock_guard<std::mutex> lock(map_mutex_);
-                cloudKeyPoses6D_.clear();
-                for (int i = 0; i < keyFrameID; ++i) {
-                    cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
-                }
-            }
-        }
-
+        // Update key frame ID (to be used for next keyframe)
+        keyFrameID++;
     }
 
     void imuOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -892,8 +891,35 @@ private:
         publishGlobalMap(this->now());
     }
 
-    void updateGraph(const gtsam::Pose3& odomStep) {
-        // PROFILE_BLOCK("Update_Graph");
+    void expandGlobalPointCloudsAndPoses(
+        const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud,
+        const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud,
+        const gtsam::Pose3& currentPose,
+        const LidarFrame& LF) {
+        // === DOWNSAMPLE BEFORE SAVING ===
+        loop_closure_filter_.setInputCloud(currentCloud);
+        loop_closure_filter_.filter(*downsampledCloud);
+
+        // Save the downsampled pose and cloud into our history
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            pcl::PointXYZ currentPose3D;
+            currentPose3D.x = currentPose.translation().x();
+            currentPose3D.y = currentPose.translation().y();
+            currentPose3D.z = currentPose.translation().z();
+            cloudKeyPoses3D_->push_back(currentPose3D);
+            cloudKeyPoses6D_.push_back(currentPose);
+
+            // Push the lightweight cloud, not the heavy one!
+            cloudKeyframes_.push_back(downsampledCloud);
+        }
+
+        // Update global key lidar frames
+        keyLidarFrames_.push_back(LF);
+    }
+
+    void addAdjacentFactor(const gtsam::Pose3& odomStep) {
+        // PROFILE_BLOCK("Add_Adjacent_Factor");
         gtsam::Symbol currentKey('X', keyFrameID);
 
         // Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
@@ -904,130 +930,141 @@ private:
             );
             // Add the initial guess (Identity)
             initialEstimate_.insert(currentKey, gtsam::Pose3::Identity());
-
-            keyFrameID++;
             return;
         }
 
         // Insert the initial guess into initialEstimate_
         gtsam::Symbol previousKey('X', keyFrameID - 1);
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(previousKey, currentKey, odomStep, odom_noise_));
-        currentPoseEstimate = currentPoseEstimate.compose(odomStep);
         initialEstimate_.insert(currentKey, currentPoseEstimate);
-        keyFrameID++;
     }
 
-    /**
-     * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
-     */
-    void detectLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& currentCloud) {
-
-        // === DOWNSAMPLE BEFORE SAVING ===
-        pcl::PointCloud<pcl::PointXYZI>::Ptr downsampledCloud(new pcl::PointCloud<pcl::PointXYZI>());
-        loop_closure_filter_.setInputCloud(currentCloud);
-        loop_closure_filter_.filter(*downsampledCloud);
-
-        // 1. Save the downsampled pose and cloud into our history
-        {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            pcl::PointXYZ currentPose3D;
-            currentPose3D.x = currentPoseEstimate.translation().x();
-            currentPose3D.y = currentPoseEstimate.translation().y();
-            currentPose3D.z = currentPoseEstimate.translation().z();
-            cloudKeyPoses3D_->push_back(currentPose3D);
-            cloudKeyPoses6D_.push_back(currentPoseEstimate);
-
-            // Push the lightweight cloud, not the heavy one!
-            cloudKeyframes_.push_back(downsampledCloud);
-        }
-
-        // uncomment to stop Loop closure to run AND not add linear factors between poses from LO
-        return;
-
-        int currentID = cloudKeyPoses3D_->size() - 1;
-
-        if (currentID < historySearchTimeDiff_) {
-            RCLCPP_DEBUG(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", currentID, historySearchTimeDiff_);
-            return;
-        }
-
-        // 2. Build the KD-Tree using our trajectory
+    int findLoopMatchID() {
+        // Build the KD-Tree using our trajectory
         // TODO: Check if cloudKeyPoses3D_ is being updated before KDTree
         kdtreeHistoryKeyPoses_->setInputCloud(cloudKeyPoses3D_);
 
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
 
-        // 3. Search for historical poses within a certain radius (e.g., 15 meters)
-        kdtreeHistoryKeyPoses_->radiusSearch(pcl::PointXYZ(currentPoseEstimate.translation().x(), currentPoseEstimate.translation().y(), currentPoseEstimate.translation().z()), historySearchRadius_, pointSearchInd, pointSearchSqDis);
+        // Search for historical poses within a certain radius (e.g., 15 meters)
+        kdtreeHistoryKeyPoses_->radiusSearch(
+            pcl::PointXYZ(currentPoseEstimate.translation().x(),
+            currentPoseEstimate.translation().y(),
+            currentPoseEstimate.translation().z()),
+            historySearchRadius_,
+            pointSearchInd,
+            pointSearchSqDis
+        );
 
         int loopMatchID = -1;
 
-        // Filter matches: We only want poses from the past, not recent frames
         for (size_t i = 0; i < pointSearchInd.size(); ++i) {
             int candidateID = pointSearchInd[i];
-            if (currentID - candidateID > historySearchTimeDiff_) {
+            // Only consider poses from the past, not recent frames
+            if (keyFrameID - candidateID > historySearchTimeDiff_) {
                 loopMatchID = candidateID;
                 break; // Found the closest valid historical frame!
             }
         }
 
-        // If no valid loop closures found, return
-        if (loopMatchID == -1) {
-            RCLCPP_DEBUG(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", currentID, historySearchTimeDiff_);
+        return loopMatchID;
+    }
+
+    bool findLoopClosureFactor(const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud, int loopMatchID, gtsam::Pose3& loopPoseFactor) {
+        PROFILE_BLOCK("Global_map_icp");
+        pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
+        icp.setMaxCorrespondenceDistance(1.5);
+        icp.setMaximumIterations(100);
+        icp.setTransformationEpsilon(1e-6);
+        icp.setEuclideanFitnessEpsilon(1e-6);
+
+        // === USE THE LIGHTWEIGHT CLOUD FOR ICP ===
+        icp.setInputSource(downsampledCloud);
+        icp.setInputTarget(cloudKeyframes_[loopMatchID]);
+
+        // TODO: Does calculateEstimate() run optimization under the hood?
+        // One between factor has already been added. Maybe that is why we are optimizing
+        gtsam::Values estimate = isam_->calculateEstimate();
+        gtsam::Pose3 pCurrent = currentPoseEstimate;
+        gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
+
+        // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely)
+        Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
+        pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
+        icp.align(*unused_result, initialGuess);
+
+        if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
+            RCLCPP_DEBUG(this->get_logger(), "Loop closure failed. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
+            return false;
+        }
+        RCLCPP_INFO(this->get_logger(), "LOOP CLOSURE DETECTED! Frame %d -> Frame %d. Fitness: %f", keyFrameID, loopMatchID, icp.getFitnessScore());
+
+        Eigen::Matrix4f icpTransform = icp.getFinalTransformation();
+        gtsam::Rot3 rot(icpTransform.block<3,3>(0,0).cast<double>());
+        gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
+        loopPoseFactor = gtsam::Pose3(rot, trans);
+
+        return true;
+    }
+
+    /**
+     * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
+     */
+    void attemptLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud) {
+
+        if (keyFrameID < historySearchTimeDiff_) {
+            RCLCPP_DEBUG(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
             return;
         }
 
-        // 5. Verification: Run ICP between current cloud and historical cloud
+        int loopMatchID = findLoopMatchID();
+
+        // If no valid loop closures found, return
+        if (loopMatchID == -1) {
+            RCLCPP_DEBUG(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
+            return;
+        }
+
+        gtsam::Pose3 loopPoseFactor = gtsam::Pose3::Identity();
+        bool isLoopClosureSuccessful = findLoopClosureFactor(downsampledCloud, loopMatchID, loopPoseFactor);
+
+        if (!isLoopClosureSuccessful) {
+            return;
+        }
+
+        // Add the loop closure factor to the graph
+        gtsam::Symbol currentKey('X', keyFrameID);
+        gtsam::Symbol historicalKey('X', loopMatchID);
+        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            historicalKey, currentKey, loopPoseFactor, loop_noise_));
+    }
+
+    void optimizeFactorGraph() {
+        PROFILE_BLOCK("ISAM2_update_on_keyframe");
+
+        // Optimize the factor graph completely incrementally
+        isam_->update(gtSAMgraph_, initialEstimate_);
+        isam_->update();
+
+        // Clear graph and estimates for next iteration
+        gtSAMgraph_.resize(0);
+        initialEstimate_.clear();
+    }
+
+    void updateGlobalPoses() {
+        // Repopulate cloudKeyPoses6D_ with ISAM2-corrected poses
+        gtsam::Values currentEstimate = isam_->calculateEstimate();
+
         {
-            PROFILE_BLOCK("Global_map_icp");
-            pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
-            icp.setMaxCorrespondenceDistance(1.5);
-            icp.setMaximumIterations(100);
-            icp.setTransformationEpsilon(1e-6);
-            icp.setEuclideanFitnessEpsilon(1e-6);
-
-            // === USE THE LIGHTWEIGHT CLOUD FOR ICP ===
-            icp.setInputSource(downsampledCloud);
-            icp.setInputTarget(cloudKeyframes_[loopMatchID]);
-
-            // TODO: Does calculateEstimate() run optimization under the hood?
-            // One between factor has already been added. Maybe that is why we are optimizing
-            gtsam::Values estimate = isam_->calculateEstimate();
-            gtsam::Pose3 pCurrent = currentPoseEstimate;
-            gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
-
-            // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely)
-            Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
-            pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
-            icp.align(*unused_result, initialGuess);
-
-            if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
-
-                return;
+            // Lock while we safely update the ISAM2 corrected poses
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            cloudKeyPoses6D_.clear();
+            cloudKeyPoses3D_->clear();
+            for (int i = 0; i < keyFrameID; ++i) {
+                cloudKeyPoses6D_.push_back(currentEstimate.at<gtsam::Pose3>(gtsam::Symbol('X', i)));
+                cloudKeyPoses3D_->push_back(pcl::PointXYZ(cloudKeyPoses6D_[i].translation().x(), cloudKeyPoses6D_[i].translation().y(), cloudKeyPoses6D_[i].translation().z()));
             }
-
-            RCLCPP_INFO(this->get_logger(), "LOOP CLOSURE DETECTED! Frame %d -> Frame %d. Fitness: %f",
-                        currentID, loopMatchID, icp.getFitnessScore());
-
-            Eigen::Matrix4f icpTransform = icp.getFinalTransformation();
-
-            gtsam::Rot3 rot(icpTransform.block<3,3>(0,0).cast<double>());
-            gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
-            gtsam::Pose3 loopPose(rot, trans);
-
-            // TODO: Tune covariances if needed
-            gtsam::Vector6 loopSigmas;
-            loopSigmas << 0.1, 0.1, 0.1, 0.2, 0.2, 0.2;
-            auto loopNoise = gtsam::noiseModel::Diagonal::Sigmas(loopSigmas);
-
-            gtsam::Symbol currentKey('X', currentID);
-            gtsam::Symbol historicalKey('X', loopMatchID);
-
-            gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                historicalKey, currentKey, loopPose, loopNoise));
-
-            // No more loop closure boolean required! The incremental solver handles it.
         }
     }
 
@@ -1040,6 +1077,11 @@ private:
     }
 
     void publishGlobalMap(const rclcpp::Time& timestamp) {
+
+        if (keyFrameID == 0) {
+            return;
+        }
+
         PROFILE_BLOCK("publishGlobalMap");
 
         std::vector<gtsam::Pose3> poses_copy;
@@ -1117,7 +1159,7 @@ private:
         nav_msgs::msg::Odometry odomMsg;
         odomMsg.header.stamp = timestamp;
         odomMsg.header.frame_id = "map";
-        odomMsg.child_frame_id = "lidar";
+        odomMsg.child_frame_id = "velodyne";
         odomMsg.pose.pose.position.x = currentTf.translation().x();
         odomMsg.pose.pose.position.y = currentTf.translation().y();
         odomMsg.pose.pose.position.z = currentTf.translation().z();
