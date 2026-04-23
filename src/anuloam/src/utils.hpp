@@ -2,6 +2,9 @@
 #include <cassert>
 #include <Eigen/Geometry>
 #include <builtin_interfaces/msg/time.hpp>
+#include <chrono>
+#include <string>
+#include <cstdio>
 
 template <typename T>
 class CircularBuffer {
@@ -63,16 +66,12 @@ inline double stamp2sec(const builtin_interfaces::msg::Time& stamp) {
     return stamp.sec + stamp.nanosec * 1e-9;
 }
 
-#include <chrono>
-#include <string>
-#include <cstdio>
-
 struct ScopedTimer {
     std::string name;
     std::chrono::high_resolution_clock::time_point start;
-    
+
     ScopedTimer(std::string n) : name(n), start(std::chrono::high_resolution_clock::now()) {}
-    
+
     ~ScopedTimer() {
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> duration = end - start;

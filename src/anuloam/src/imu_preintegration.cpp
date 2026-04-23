@@ -38,7 +38,7 @@ class ImuPreintegration : public rclcpp::Node
         "/odom_incremental", 10, std::bind(&ImuPreintegration::odomCallback, this, std::placeholders::_1)
       );
 
-      // imu extrinsics 
+      // imu extrinsics
       // TODO make params?
       extRot = (Eigen::Matrix3d() << 0, 1.f, 0, -1.f, 0, 0, 0, 0, 1.f).finished();
 
@@ -84,7 +84,7 @@ class ImuPreintegration : public rclcpp::Node
 
       // set up preintegrator
       // TODO need to check if gravity already subtracted
-      boost::shared_ptr<gtsam::PreintegratedCombinedMeasurements::Params> p = gtsam::PreintegratedCombinedMeasurements::Params::MakeSharedU(); 
+      boost::shared_ptr<gtsam::PreintegratedCombinedMeasurements::Params> p = gtsam::PreintegratedCombinedMeasurements::Params::MakeSharedU();
       p->accelerometerCovariance = gtsam::Matrix33::Identity(3,3) * pow(accel_noise_sigma_, 2);
       p->gyroscopeCovariance = gtsam::Matrix33::Identity(3,3) * pow(gyro_noise_sigma_, 2);
       p->integrationCovariance = gtsam::Matrix33::Identity(3,3) * pow(1e-4, 2); // TODO: should this be tunable?
@@ -112,7 +112,7 @@ class ImuPreintegration : public rclcpp::Node
       double imuTimeNow = imu_meas.header.stamp.sec + imu_meas.header.stamp.nanosec * 1e-9;
       double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTimeNow - lastImuT_imu);
       lastImuT_imu = imuTimeNow;
-      imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+      imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z),
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
 
       // predict odometry
@@ -186,7 +186,7 @@ class ImuPreintegration : public rclcpp::Node
 
         if (imu_time < stamp2sec(msg->header.stamp)) {
           double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imu_time - lastImuT_opt);
-          imu_integrator_opt_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+          imu_integrator_opt_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z),
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
           lastImuT_opt = imu_time;
           imu_q_.pop_front();
@@ -240,7 +240,7 @@ class ImuPreintegration : public rclcpp::Node
         sensor_msgs::msg::Imu imu_meas = imu_q_[i];
         double imu_time = stamp2sec(imu_meas.header.stamp);
         double dt = (lastImuT_reprop < 0) ? (1.0 / 500.0) : (imu_time - lastImuT_reprop);
-        imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z), 
+        imu_integrator_live_->integrateMeasurement(gtsam::Vector3(imu_meas.linear_acceleration.x, imu_meas.linear_acceleration.y, imu_meas.linear_acceleration.z),
                                             gtsam::Vector3(imu_meas.angular_velocity.x, imu_meas.angular_velocity.y, imu_meas.angular_velocity.z), dt);
         lastImuT_reprop = imu_time;
       }
@@ -284,12 +284,12 @@ class ImuPreintegration : public rclcpp::Node
     gtsam::NonlinearFactorGraph graph_;
     gtsam::Values values_;
 
-    // PreintegratedCombinedMeasurements integrates the bias random walk 
-    // into the preintegration itself using the random walk sigma (not an actual 
-    // covariance, how fast the bias drifts over time). 
-    // PreintegratedImuMeasurements must be used in conjunction with a manual 
+    // PreintegratedCombinedMeasurements integrates the bias random walk
+    // into the preintegration itself using the random walk sigma (not an actual
+    // covariance, how fast the bias drifts over time).
+    // PreintegratedImuMeasurements must be used in conjunction with a manual
     // BetweenFactor<imuBias::ConstantBias> to approximate this and even then
-    // it is an approximation. 
+    // it is an approximation.
     std::shared_ptr<gtsam::PreintegratedCombinedMeasurements> imu_integrator_live_;
     std::shared_ptr<gtsam::PreintegratedCombinedMeasurements> imu_integrator_opt_;
 

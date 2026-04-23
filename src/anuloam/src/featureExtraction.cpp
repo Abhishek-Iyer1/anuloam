@@ -11,7 +11,7 @@
 #include <vector>
 #include <queue>
 #include <thread>
-#include <chrono> 
+#include <chrono>
 #include "utils.hpp"
 
 #define NUM_RINGS 16
@@ -322,9 +322,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                   std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
 
     if (map.getKeyframes().size() == 0) {return;}
-    
+
     auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     const int maxIterations = 50;
     const float epsilon = 1e-5;
     const float maxDistSq = 1.0;
@@ -355,14 +355,14 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
 
                 // Verification: Line segment must have non-zero length
                 if ((pj - pl).norm() < 1e-3f) continue;
-                
+
                 // Math: d = |(pi-pj) x (pi-pl)| / |pj-pl|
                 // vUnit = (pj - pl) / || pj - pl ||
                 // Jacobian = [ [vUnit]_x @ [P_i]_x     -[vUnit]_x ]
                 // b_i = [e_0]_x @ vUnit
                 Eigen::Vector3f vUnit = (pl - pj) / (pl - pj).norm();
                 Eigen::Vector3f bi = (pi - pj).cross(vUnit); // 3x1
-                
+
                 edgeLoss += bi.squaredNorm();
                 edgeCount++;
 
@@ -399,9 +399,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // Verification: Line segment must have non-zero length
                 Eigen::Vector3f normal = (pu - pv).cross(pu - pw);
                 float normalMag = normal.norm();
-                
+
                 if (normalMag < 1e-3f) continue;
-                
+
                 Eigen::Vector3f unitNormal = normal / normalMag;
 
                 // Math: d = |(pu - pv) x (pw - pv) . (pi - pv)| / |(pu - pv) x  (pw - pv)|
@@ -410,7 +410,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
                 // b_i = unit_normal.T @ (pi - pv)
 
                 float bi = unitNormal.transpose().dot(pi - pv);
-                
+
                 patchLoss += (bi * bi);
                 patchCount++;
 
@@ -423,7 +423,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             }
         }
 
-        std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n", 
+        std::printf("[Iter %02d] Edges: %4d (Loss: %8.4f) | Patches: %4d (Loss: %8.4f) | Total: %8.4f\n",
                     iter, edgeCount, edgeLoss, patchCount, patchLoss, (edgeLoss + patchLoss));
 
         if (iterCallback) {
@@ -462,7 +462,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         }
 
     }
-    
+
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration = end_time - start_time;
     std::printf("--- scanMatching completed in %.2f ms ---\n", duration.count());
@@ -474,9 +474,9 @@ public:
   FeatureExtraction() : Node("feature_extraction"), localMap(50) {
     // TODO: check what QoS profile to follow here
     imu_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        "/odom", 10, 
+        "/odom", 10,
         std::bind(&FeatureExtraction::imuCallback, this, std::placeholders::_1));
-        
+
     lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         "/points_raw", 50,
         std::bind(&FeatureExtraction::pointCloudCallback, this, std::placeholders::_1));
@@ -521,11 +521,11 @@ private:
         sensor_msgs::msg::PointCloud2 localMapROS;
         pcl::toROSMsg(localMap.getVoxels(), localMapROS);
         localMapROS.header = msg->header;
-        localMapROS.header.frame_id = "map"; 
+        localMapROS.header.frame_id = "map";
         pubLocalMap_->publish(localMapROS);
 
         is_initialized = true;
-        return; 
+        return;
     }
 
     double cloud_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
@@ -543,11 +543,11 @@ private:
             }
             imu_q_.pop_front();
         }
-        
+
         // Extract the orientation from the IMU message
         const auto& o = imu_odo_meas.pose.pose.orientation;
         Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
-        
+
         // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
         tf_guess.linear() = imu_quat.normalized().toRotationMatrix();
     }
@@ -556,8 +556,8 @@ private:
         sensor_msgs::msg::PointCloud2 scanMsg;
         pcl::toROSMsg(alignedCloud, scanMsg);
         scanMsg.header = msg->header;
-        scanMsg.header.frame_id = "map"; 
-        pubTest_->publish(scanMsg); 
+        scanMsg.header.frame_id = "map";
+        pubTest_->publish(scanMsg);
     };
 
     scanMatching(localMap, LF, tf_guess, visualizeIter);
@@ -567,18 +567,18 @@ private:
     // @todo: Add a check for if tf greater than some threshold. If so add it as a keyframe
     bool should_add_keyframe = false;
     if (localMap.getKeyframes().size() == 0) {
-        should_add_keyframe = true; 
+        should_add_keyframe = true;
     } else {
         size_t last_idx = localMap.getKeyframes().size() - 1;
         Eigen::Isometry3f last_pose = localMap.getKeyframes()[last_idx].second;
-        
+
         Eigen::Isometry3f delta = last_pose.inverse() * current_lo_pose_;
-        
+
         float translation_diff = delta.translation().norm();
         float rotation_diff = std::abs(Eigen::AngleAxisf(delta.rotation()).angle());
 
         // Thresholds: 0.5 meters or ~5.7 degrees (0.1 radians)
-        if (translation_diff > 0.5f || rotation_diff > 0.1f) { 
+        if (translation_diff > 0.5f || rotation_diff > 0.1f) {
             should_add_keyframe = true;
         }
     }
@@ -587,12 +587,12 @@ private:
         localMap.pushKeyframe({LF, current_lo_pose_});
     }
 
-    // publish this tf as an odometry msg 
+    // publish this tf as an odometry msg
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header.stamp = msg->header.stamp;
     odom_msg.header.frame_id = "map";
     odom_msg.child_frame_id = "velodyne";
-    
+
     odom_msg.pose.pose.position.x = current_lo_pose_.translation().x();
     odom_msg.pose.pose.position.y = current_lo_pose_.translation().y();
     odom_msg.pose.pose.position.z = current_lo_pose_.translation().z();
@@ -607,7 +607,7 @@ private:
     sensor_msgs::msg::PointCloud2 localMapROS;
     pcl::toROSMsg(localMap.getVoxels(), localMapROS);
     localMapROS.header = msg->header;
-    localMapROS.header.frame_id = "map"; 
+    localMapROS.header.frame_id = "map";
     pubLocalMap_->publish(localMapROS);
 
     // Convert PCL -> ROS message and publish IGNORE
@@ -626,7 +626,7 @@ private:
   LocalMap localMap;
 
   std::deque<nav_msgs::msg::Odometry> imu_q_;
-  
+
   // Member to store the ongoing Lidar Odometry pose
   Eigen::Isometry3f current_lo_pose_ = Eigen::Isometry3f::Identity();
 };
