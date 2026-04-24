@@ -731,8 +731,8 @@ private:
 
     // LiDAR processing
     LocalMap localMap;
-    const float keyframeTranslationThresh_ = 0.3f;   // 30 cm
-    const float keyframeRotationThresh_ = 0.2618f;   // ~15 degrees in radians
+    const float keyframeTranslationThresh_ = 1.0f;    // 1 m
+    const float keyframeRotationThresh_ = 0.1745f;   // ~10 degrees in radians
 
     // LiDAR odometry variables
     std::deque<nav_msgs::msg::Odometry> imu_q_;
@@ -768,6 +768,7 @@ private:
     double historySearchRadius_ = 15.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
     double icpFitnessThreshold_ = 0.3;  // Lower is better
+    int loopClosureNeighborhood_ = 12;  // Frames before and after match ID used in loop local map (total = 2*N+1)
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         auto cb_start = std::chrono::high_resolution_clock::now();
@@ -1000,9 +1001,9 @@ private:
     bool findLoopClosureFactor(LidarFrame& currentLF, int loopMatchID, gtsam::Pose3& loopPoseFactor) {
         PROFILE_BLOCK("findLoopClosureFactor");
 
-        // Build a 7-frame LocalMap around the loop candidate in the map frame
-        int start = std::max(0, loopMatchID - 3);
-        int end   = std::min((int)keyLidarFrames_.size() - 1, loopMatchID + 3);
+        // Build a (2*loopClosureNeighborhood_+1)-frame LocalMap around the loop candidate in the map frame
+        int start = std::max(0, loopMatchID - loopClosureNeighborhood_);
+        int end   = std::min((int)keyLidarFrames_.size() - 1, loopMatchID + loopClosureNeighborhood_);
 
         LocalMap loopLocalMap(end - start + 1);
         for (int j = start; j <= end; ++j) {
