@@ -641,7 +641,7 @@ public:
         rclcpp::SubscriptionOptions lidar_options;
         lidar_options.callback_group = lidar_cb_group_;
         subPoints_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/points_raw",
+            "/deskewed_raw",
             50,
             std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1),
             lidar_options
