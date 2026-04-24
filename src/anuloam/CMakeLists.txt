@@ -59,13 +59,17 @@ add_executable(global_map src/globalMap.cpp)
 ament_target_dependencies(global_map rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
 target_link_libraries(global_map ${PCL_LIBRARIES} gtsam)
 
-set_target_properties(global_map PROPERTIES
+add_executable(deskew src/deskew.cpp)
+ament_target_dependencies(deskew rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
+target_link_libraries(deskew ${PCL_LIBRARIES})
+
+set_target_properties(global_map deskew PROPERTIES
   INSTALL_RPATH "/opt/ros/humble/lib"
   INSTALL_RPATH_USE_LINK_PATH FALSE
   BUILD_WITH_INSTALL_RPATH TRUE
 )
 
-install(TARGETS global_map
+install(TARGETS global_map deskew
   DESTINATION lib/${PROJECT_NAME}
 )
 
