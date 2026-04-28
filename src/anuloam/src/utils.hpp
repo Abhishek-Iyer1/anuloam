@@ -6,8 +6,8 @@
 #include <string>
 #include <cstdio>
 #include <nav_msgs/msg/odometry.hpp>
-#include <Eigen/Geometry>
-
+#include <sensor_msgs/msg/imu.hpp>
+#include <rclcpp/rclcpp.hpp>
 
 template <typename T>
 class CircularBuffer {
@@ -149,3 +149,50 @@ struct ScopedTimer {
 
 // Macro to make it easy to drop into any block
 #define PROFILE_BLOCK(name) ScopedTimer timer_##__LINE__(name)
+
+/**
+ * @brief: LIO-SAM IMU converter which performs necessary frame conversions
+ */
+inline const Eigen::Matrix3d extRot = (Eigen::Matrix3d() << 
+    -1.0,  0.0,  0.0,
+     0.0,  1.0,  0.0,
+     0.0,  0.0, -1.0).finished();
+
+inline const Eigen::Matrix3d extRPY = (Eigen::Matrix3d() << 
+     0.0,  1.0,  0.0,
+    -1.0,  0.0,  0.0,
+     0.0,  0.0,  1.0).finished();
+
+inline const Eigen::Quaterniond extQRPY(extRPY);
+
+inline sensor_msgs::msg::Imu imuConverter(const sensor_msgs::msg::Imu& imu_in)
+{
+    sensor_msgs::msg::Imu imu_out = imu_in;
+    // rotate acceleration
+    Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
+    acc = extRot * acc;
+    imu_out.linear_acceleration.x = acc.x();
+    imu_out.linear_acceleration.y = acc.y();
+    imu_out.linear_acceleration.z = acc.z();
+    // rotate gyroscope
+    Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
+    gyr = extRot * gyr;
+    imu_out.angular_velocity.x = gyr.x();
+    imu_out.angular_velocity.y = gyr.y();
+    imu_out.angular_velocity.z = gyr.z();
+    // rotate roll pitch yaw
+    Eigen::Quaterniond q_from(imu_in.orientation.w, imu_in.orientation.x, imu_in.orientation.y, imu_in.orientation.z);
+    Eigen::Quaterniond q_final = q_from * extQRPY;
+    imu_out.orientation.x = q_final.x();
+    imu_out.orientation.y = q_final.y();
+    imu_out.orientation.z = q_final.z();
+    imu_out.orientation.w = q_final.w();
+
+    if (sqrt(q_final.x()*q_final.x() + q_final.y()*q_final.y() + q_final.z()*q_final.z() + q_final.w()*q_final.w()) < 0.1)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("imu_converter"), "Invalid quaternion, please use a 9-axis IMU!");
+        rclcpp::shutdown();
+    }
+
+    return imu_out;
+}

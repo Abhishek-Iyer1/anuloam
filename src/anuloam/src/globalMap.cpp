@@ -329,6 +329,7 @@ public:
         * @todo: Multithreading
         */
     void extract3DFeatures() {
+        PROFILE_BLOCK("Extract 3D Features");
         this->extractRings(_pcl);
 
         // create buckets per ring to containerize the memory accessed by each thread
@@ -403,10 +404,14 @@ public:
         * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
         */
     void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
+        PROFILE_BLOCK("Update Local Map");
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
 
+    /**
+     * @todo: Can we improve this with an unmerge operation, similar to that of the globalMap?
+     */
     void updateVoxelMaps() {
         pcl::PointCloud<PointXYZIR>::Ptr rawEdges(new pcl::PointCloud<PointXYZIR>());
         pcl::PointCloud<PointXYZIR>::Ptr rawPatches(new pcl::PointCloud<PointXYZIR>());
@@ -817,7 +822,7 @@ private:
         addAdjacentFactor(eigenIsometryToPose3(delta));
 
         // Attempt Loop Closure
-        attemptLoopClosure(LF);
+        // attemptLoopClosure(LF);
 
         optimizeFactorGraph();
 
@@ -957,6 +962,9 @@ private:
         initialEstimate_.insert(currentKey, currentPoseEstimate);
     }
 
+    /**
+     * @todo: replace this with simple vectorized radius check using Eigen (euclidian dist within threshold, sort, return top match)
+     */
     int findLoopMatchID() {
         PROFILE_BLOCK("findLoopMatchID");
         // Build a temporary position cloud from the 6D poses
