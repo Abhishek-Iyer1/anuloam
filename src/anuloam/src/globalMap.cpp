@@ -650,7 +650,7 @@ public:
         rclcpp::SubscriptionOptions imu_options;
         imu_options.callback_group = imu_cb_group_;
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom_imu",
+            "/odom",
             10,
             std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1),
             imu_options
@@ -1038,7 +1038,7 @@ private:
     void attemptLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud) {
 
         if (keyFrameID < historySearchTimeDiff_) {
-            RCLCPP_DEBUG(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
+            RCLCPP_INFO(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
             return;
         }
 
@@ -1046,7 +1046,7 @@ private:
 
         // If no valid loop closures found, return
         if (loopMatchID == -1) {
-            RCLCPP_DEBUG(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
+            RCLCPP_INFO(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
             return;
         }
 
