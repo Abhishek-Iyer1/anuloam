@@ -106,7 +106,7 @@ public:
     }
 
     void update(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
-        PROFILE_BLOCK("GlobalPointMap_update");
+        // PROFILE_BLOCK("GlobalPointMap_update");
         Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
 
         // Loop directly over the incoming frame, no intermediate downsampling needed
@@ -329,6 +329,7 @@ public:
         * @todo: Multithreading
         */
     void extract3DFeatures() {
+        PROFILE_BLOCK("Extract 3D Features");
         this->extractRings(_pcl);
 
         // create buckets per ring to containerize the memory accessed by each thread
@@ -403,10 +404,14 @@ public:
         * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
         */
     void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
+        PROFILE_BLOCK("Update Local Map");
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
 
+    /**
+     * @todo: Can we improve this with an unmerge operation, similar to that of the globalMap?
+     */
     void updateVoxelMaps() {
         pcl::PointCloud<PointXYZIR>::Ptr rawEdges(new pcl::PointCloud<PointXYZIR>());
         pcl::PointCloud<PointXYZIR>::Ptr rawPatches(new pcl::PointCloud<PointXYZIR>());
@@ -641,7 +646,7 @@ public:
         rclcpp::SubscriptionOptions lidar_options;
         lidar_options.callback_group = lidar_cb_group_;
         subPoints_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/points_raw",
+            "/deskewed_raw",
             50,
             std::bind(&GlobalMapNode::pointCloudCallback, this, std::placeholders::_1),
             lidar_options
@@ -731,8 +736,8 @@ private:
 
     // LiDAR processing
     LocalMap localMap;
-    const float keyframeTranslationThresh_ = 0.3f;   // 30 cm
-    const float keyframeRotationThresh_ = 0.2618f;   // ~15 degrees in radians
+    const float keyframeTranslationThresh_ = 1.0f;    // 1 m
+    const float keyframeRotationThresh_ = 0.1745f;   // ~10 degrees in radians
 
     // LiDAR odometry variables
     std::deque<nav_msgs::msg::Odometry> imu_q_;
@@ -757,6 +762,7 @@ private:
 
     std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> cloudKeyframes_;
     std::vector<LidarFrame> keyLidarFrames_;
+    int loopClosureCount_ = 0;
 
 
     pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
@@ -767,6 +773,7 @@ private:
     double historySearchRadius_ = 15.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
     double icpFitnessThreshold_ = 0.3;  // Lower is better
+    int loopClosureNeighborhood_ = 12;  // Frames before and after match ID used in loop local map (total = 2*N+1)
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         auto cb_start = std::chrono::high_resolution_clock::now();
@@ -815,7 +822,7 @@ private:
         addAdjacentFactor(eigenIsometryToPose3(delta));
 
         // Attempt Loop Closure
-        attemptLoopClosure(downsampledCloud);
+        // attemptLoopClosure(LF);
 
         optimizeFactorGraph();
 
@@ -955,7 +962,11 @@ private:
         initialEstimate_.insert(currentKey, currentPoseEstimate);
     }
 
+    /**
+     * @todo: replace this with simple vectorized radius check using Eigen (euclidian dist within threshold, sort, return top match)
+     */
     int findLoopMatchID() {
+        PROFILE_BLOCK("findLoopMatchID");
         // Build a temporary position cloud from the 6D poses
         pcl::PointCloud<pcl::PointXYZ>::Ptr posCloud(new pcl::PointCloud<pcl::PointXYZ>());
         posCloud->reserve(cloudKeyPoses6D_.size());
@@ -995,47 +1006,36 @@ private:
         return loopMatchID;
     }
 
-    bool findLoopClosureFactor(const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud, int loopMatchID, gtsam::Pose3& loopPoseFactor) {
-        PROFILE_BLOCK("Global_map_icp");
-        pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
-        icp.setMaxCorrespondenceDistance(1.5);
-        icp.setMaximumIterations(100);
-        icp.setTransformationEpsilon(1e-6);
-        icp.setEuclideanFitnessEpsilon(1e-6);
+    bool findLoopClosureFactor(LidarFrame& currentLF, int loopMatchID, gtsam::Pose3& loopPoseFactor) {
+        PROFILE_BLOCK("findLoopClosureFactor");
 
-        // === USE THE LIGHTWEIGHT CLOUD FOR ICP ===
-        icp.setInputSource(downsampledCloud);
-        icp.setInputTarget(cloudKeyframes_[loopMatchID]);
+        // Build a (2*loopClosureNeighborhood_+1)-frame LocalMap around the loop candidate in the map frame
+        int start = std::max(0, loopMatchID - loopClosureNeighborhood_);
+        int end   = std::min((int)keyLidarFrames_.size() - 1, loopMatchID + loopClosureNeighborhood_);
 
-        // TODO: Does calculateEstimate() run optimization under the hood?
-        // One between factor has already been added. Maybe that is why we are optimizing
-        gtsam::Values estimate = isam_->calculateEstimate();
-        gtsam::Pose3 pCurrent = currentPoseEstimate;
-        gtsam::Pose3 pHistory = estimate.at<gtsam::Pose3>(gtsam::Symbol('X', loopMatchID));
-
-        // TODO: check whether ICP uses delta transformation from source to target as the initial guess (pretty likely)
-        Eigen::Matrix4f initialGuess = pose3ToEigenIsometry(pHistory.inverse().compose(pCurrent)).matrix();
-        pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
-        icp.align(*unused_result, initialGuess);
-
-        if (icp.hasConverged() == false || icp.getFitnessScore() > icpFitnessThreshold_) {
-            RCLCPP_DEBUG(this->get_logger(), "Loop closure failed. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
-            return false;
+        LocalMap loopLocalMap(end - start + 1);
+        for (int j = start; j <= end; ++j) {
+            loopLocalMap.pushKeyframe({keyLidarFrames_[j], pose3ToEigenIsometry(cloudKeyPoses6D_[j])});
         }
-        RCLCPP_INFO(this->get_logger(), "LOOP CLOSURE DETECTED! Frame %d -> Frame %d. Fitness: %f", keyFrameID, loopMatchID, icp.getFitnessScore());
 
-        Eigen::Matrix4f icpTransform = icp.getFinalTransformation();
-        gtsam::Rot3 rot(icpTransform.block<3,3>(0,0).cast<double>());
-        gtsam::Point3 trans(icpTransform.block<3,1>(0,3).cast<double>());
-        loopPoseFactor = gtsam::Pose3(rot, trans);
+        // Initial guess = dead-reckoned absolute pose of current frame in map frame
+        Eigen::Isometry3f initialGuess = pose3ToEigenIsometry(currentPoseEstimate);
+        scanMatching(loopLocalMap, currentLF, initialGuess);
 
+        // Recover BetweenFactor delta: pose_i^{-1} * refinedPose
+        gtsam::Pose3 refinedPose = eigenIsometryToPose3(initialGuess);
+        loopPoseFactor = cloudKeyPoses6D_[loopMatchID].inverse().compose(refinedPose);
+
+        loopClosureCount_++;
+        RCLCPP_WARN(this->get_logger(), ">>> LOOP CLOSURE DETECTED! Frame %d -> Frame %d | Total loop closures: %d <<<", keyFrameID, loopMatchID, loopClosureCount_);
         return true;
     }
 
     /**
      * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
      */
-    void attemptLoopClosure(const pcl::PointCloud<pcl::PointXYZI>::Ptr& downsampledCloud) {
+    void attemptLoopClosure(LidarFrame& currentLF) {
+        PROFILE_BLOCK("attemptLoopClosure");
 
         if (keyFrameID < historySearchTimeDiff_) {
             RCLCPP_INFO(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
@@ -1050,10 +1050,13 @@ private:
             return;
         }
 
+        RCLCPP_INFO(this->get_logger(), "Loop closure candidate found. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
+
         gtsam::Pose3 loopPoseFactor = gtsam::Pose3::Identity();
-        bool isLoopClosureSuccessful = findLoopClosureFactor(downsampledCloud, loopMatchID, loopPoseFactor);
+        bool isLoopClosureSuccessful = findLoopClosureFactor(currentLF, loopMatchID, loopPoseFactor);
 
         if (!isLoopClosureSuccessful) {
+            RCLCPP_DEBUG(this->get_logger(), "Loop closure failed. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
             return;
         }
 
@@ -1104,7 +1107,7 @@ private:
             return;
         }
 
-        PROFILE_BLOCK("publishGlobalMap");
+        // PROFILE_BLOCK("publishGlobalMap");
 
         std::vector<gtsam::Pose3> poses_copy;
         std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
