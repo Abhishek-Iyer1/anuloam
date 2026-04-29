@@ -40,7 +40,8 @@
 
 #define NUM_RINGS 16
 
-static constexpr bool ENABLE_LOOP_CLOSURE = false;
+// Toggle to enable or disable loop closures
+static constexpr bool ENABLE_LOOP_CLOSURE = true;
 
 struct PointXYZIR {
     PCL_ADD_POINT4D;
@@ -409,7 +410,7 @@ public:
         * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
         */
     void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
-        PROFILE_BLOCK("Update Local Map");
+        // PROFILE_BLOCK("Update Local Map");
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
@@ -800,7 +801,7 @@ private:
     // Loop Closure Parameters
     double historySearchRadius_ = 15.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
-    double icpFitnessThreshold_ = 0.3;  // Lower is better
+    double scanMatchFitnessThreshold_ = 0.3;  // Lower is better
     int loopClosureNeighborhood_ = 12;  // Frames before and after match ID used in loop local map (total = 2*N+1)
 
     void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
@@ -837,6 +838,7 @@ private:
         localMap.pushKeyframe({LF, currentTf});
         // RCLCPP_INFO(this->get_logger(), "New keyframe added. Local map size: %zu", localMap.getKeyframes().size());
 
+        // TODO: We are not updating the local map after loop closure. It diverges from the global map. Is this problematic?
         publishLocalMap(msg->header.stamp);
 
         // Update current pose estimate. This is global estimate, affected by loop closure
@@ -1052,6 +1054,44 @@ private:
         return loopMatchID;
     }
 
+    bool isMatchingSuccess(
+        const LidarFrame& lf,
+        const Eigen::Isometry3f& refinedPose,
+        const LocalMap& localMap)
+    {
+        const pcl::PointCloud<PointXYZIR> refinedEdges   = lf.transformEdges(refinedPose);
+        const pcl::PointCloud<PointXYZIR> refinedPatches = lf.transformPatches(refinedPose);
+
+        double totalDist = 0.0;
+        int    count     = 0;
+        std::vector<int>   idx;
+        std::vector<float> sqDists;
+
+        for (const auto& pt : refinedEdges) {
+            if (localMap.findEdgeNeighbors(pt, idx, sqDists)) {
+                totalDist += std::sqrt(sqDists[0]);
+                ++count;
+            }
+        }
+        for (const auto& pt : refinedPatches) {
+            if (localMap.findPlaneNeighbors(pt, idx, sqDists)) {
+                totalDist += std::sqrt(sqDists[0]);
+                ++count;
+            }
+        }
+
+        if (count == 0) {
+            RCLCPP_WARN(get_logger(), "[LoopClosure] Fitness: no correspondences found — rejecting");
+            return false;
+        }
+        double meanDist = totalDist / count;
+        bool passed = meanDist <= scanMatchFitnessThreshold_;
+        RCLCPP_INFO(get_logger(),
+            "[LoopClosure] Fitness: %.4f m | threshold: %.4f m | %s",
+            meanDist, scanMatchFitnessThreshold_, passed ? "ACCEPTED" : "REJECTED");
+        return passed;
+    }
+
     bool findLoopClosureFactor(
         LidarFrame& currentLF,
         const gtsam::Pose3& currentPose,
@@ -1069,6 +1109,10 @@ private:
 
         Eigen::Isometry3f initialGuess = pose3ToEigenIsometry(currentPose);
         scanMatching(loopLocalMap, currentLF, initialGuess);
+
+        if (!isMatchingSuccess(currentLF, initialGuess, loopLocalMap)) {
+            return false;
+        }
 
         gtsam::Pose3 refinedPose = eigenIsometryToPose3(initialGuess);
         loopPoseFactor = poseSnapshot[relativeLoopMatchIdx].inverse().compose(refinedPose);
