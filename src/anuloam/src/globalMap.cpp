@@ -799,7 +799,7 @@ private:
     pcl::VoxelGrid<pcl::PointXYZI> loop_closure_filter_;
 
     // Loop Closure Parameters
-    double historySearchRadius_ = 15.0; // Meters
+    double historySearchRadius_ = 30.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
     double scanMatchFitnessThreshold_ = 0.3;  // Lower is better
     int loopClosureNeighborhood_ = 12;  // Frames before and after match ID used in loop local map (total = 2*N+1)
