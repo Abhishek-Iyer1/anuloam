@@ -33,9 +33,14 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <queue>
 #include "utils.hpp"
 
 #define NUM_RINGS 16
+
+static constexpr bool ENABLE_LOOP_CLOSURE = false;
 
 struct PointXYZIR {
     PCL_ADD_POINT4D;
@@ -655,7 +660,7 @@ public:
         rclcpp::SubscriptionOptions imu_options;
         imu_options.callback_group = imu_cb_group_;
         subImuOdom_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom",
+            "/odom_imu",
             10,
             std::bind(&GlobalMapNode::imuOdomCallback, this, std::placeholders::_1),
             imu_options
@@ -707,6 +712,17 @@ public:
         isam_ = std::make_unique<gtsam::ISAM2>(parameters);
 
         loop_closure_filter_.setLeafSize(0.4f, 0.4f, 0.4f);
+
+        loop_closure_thread_ = std::thread(&GlobalMapNode::loopClosureThreadFn, this);
+    }
+
+    ~GlobalMapNode() {
+        {
+            std::lock_guard<std::mutex> lk(loop_input_mutex_);
+            loop_thread_stop_ = true;
+        }
+        loop_input_cv_.notify_one();
+        loop_closure_thread_.join();
     }
 
 private:
@@ -717,6 +733,20 @@ private:
     rclcpp::TimerBase::SharedPtr map_timer_;
     std::mutex imu_mutex_;
     std::mutex map_mutex_;
+
+    // Loop closure threading
+    struct LoopClosureOutput {
+        int historicalKeyID;
+        int currentKeyID;
+        gtsam::Pose3 factor;
+    };
+    std::queue<int>               loop_input_queue_;
+    std::mutex                    loop_input_mutex_;
+    std::condition_variable       loop_input_cv_;
+    bool                          loop_thread_stop_ = false;
+    std::queue<LoopClosureOutput> loop_output_queue_;
+    std::mutex                    loop_output_mutex_;
+    std::thread                   loop_closure_thread_;
 
     // TF2 Broadcaster
     // std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -764,8 +794,6 @@ private:
     std::vector<LidarFrame> keyLidarFrames_;
     int loopClosureCount_ = 0;
 
-
-    pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kdtreeHistoryKeyPoses_{new pcl::KdTreeFLANN<pcl::PointXYZ>()};
 
     pcl::VoxelGrid<pcl::PointXYZI> loop_closure_filter_;
 
@@ -821,8 +849,34 @@ private:
         // Update Factor Graph with the pose
         addAdjacentFactor(eigenIsometryToPose3(delta));
 
-        // Attempt Loop Closure
-        // attemptLoopClosure(LF);
+        // Enqueue keyframe ID for the loop closure thread (bounded at 10)
+        {
+            std::lock_guard<std::mutex> lk(loop_input_mutex_);
+            if (loop_input_queue_.size() >= 10) {
+                RCLCPP_ERROR(get_logger(),
+                    "[LoopClosure] Input queue saturated (%zu items) — loop closure is falling behind!",
+                    loop_input_queue_.size());
+            } else {
+                loop_input_queue_.push(keyFrameID);
+                loop_input_cv_.notify_one();
+            }
+        }
+
+        // Drain any pending loop closure factors before optimizing
+        {
+            std::lock_guard<std::mutex> lk(loop_output_mutex_);
+            while (!loop_output_queue_.empty()) {
+                auto& lc = loop_output_queue_.front();
+                gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                    gtsam::Symbol('X', lc.historicalKeyID),
+                    gtsam::Symbol('X', lc.currentKeyID),
+                    lc.factor, loop_noise_));
+                loopClosureCount_++;
+                RCLCPP_WARN(get_logger(), ">>> LOOP CLOSURE DETECTED! Frame %d -> Frame %d | Total: %d <<<",
+                    lc.currentKeyID, lc.historicalKeyID, loopClosureCount_);
+                loop_output_queue_.pop();
+            }
+        }
 
         optimizeFactorGraph();
 
@@ -931,13 +985,9 @@ private:
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             cloudKeyPoses6D_.push_back(currentPose);
-
-            // Push the lightweight cloud, not the heavy one!
             cloudKeyframes_.push_back(downsampledCloud);
+            keyLidarFrames_.push_back(LF);
         }
-
-        // Update global key lidar frames
-        keyLidarFrames_.push_back(LF);
         RCLCPP_INFO(this->get_logger(), "Added Global Keyframe. keyLidarFrames_ size: %zu", keyLidarFrames_.size());
     }
 
@@ -965,106 +1015,129 @@ private:
     /**
      * @todo: replace this with simple vectorized radius check using Eigen (euclidian dist within threshold, sort, return top match)
      */
-    int findLoopMatchID() {
+    int findLoopMatchID(const std::vector<gtsam::Pose3>& poseSnapshot, int currentKeyID) {
         PROFILE_BLOCK("findLoopMatchID");
-        // Build a temporary position cloud from the 6D poses
         pcl::PointCloud<pcl::PointXYZ>::Ptr posCloud(new pcl::PointCloud<pcl::PointXYZ>());
-        posCloud->reserve(cloudKeyPoses6D_.size());
-        for (const auto& pose : cloudKeyPoses6D_) {
+        posCloud->reserve(poseSnapshot.size());
+        for (const auto& pose : poseSnapshot) {
             posCloud->push_back(pcl::PointXYZ(
                 pose.translation().x(),
                 pose.translation().y(),
                 pose.translation().z()
             ));
         }
-        kdtreeHistoryKeyPoses_->setInputCloud(posCloud);
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(posCloud);
 
+        const auto& queryPose = poseSnapshot[currentKeyID];
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
-
-        // Search for historical poses within a certain radius (e.g., 15 meters)
-        kdtreeHistoryKeyPoses_->radiusSearch(
-            pcl::PointXYZ(currentPoseEstimate.translation().x(),
-            currentPoseEstimate.translation().y(),
-            currentPoseEstimate.translation().z()),
+        kdtree.radiusSearch(
+            pcl::PointXYZ(queryPose.translation().x(),
+                          queryPose.translation().y(),
+                          queryPose.translation().z()),
             historySearchRadius_,
             pointSearchInd,
             pointSearchSqDis
         );
 
         int loopMatchID = -1;
-
         for (size_t i = 0; i < pointSearchInd.size(); ++i) {
             int candidateID = pointSearchInd[i];
-            // Only consider poses from the past, not recent frames
-            if (keyFrameID - candidateID > historySearchTimeDiff_) {
+            if (currentKeyID - candidateID > historySearchTimeDiff_) {
                 loopMatchID = candidateID;
-                break; // Found the closest valid historical frame!
+                break;
             }
         }
-
         return loopMatchID;
     }
 
-    bool findLoopClosureFactor(LidarFrame& currentLF, int loopMatchID, gtsam::Pose3& loopPoseFactor) {
+    bool findLoopClosureFactor(
+        LidarFrame& currentLF,
+        const gtsam::Pose3& currentPose,
+        int relativeLoopMatchIdx,
+        const std::vector<LidarFrame>& frameSnapshot,
+        const std::vector<gtsam::Pose3>& poseSnapshot,
+        gtsam::Pose3& loopPoseFactor)
+    {
         PROFILE_BLOCK("findLoopClosureFactor");
 
-        // Build a (2*loopClosureNeighborhood_+1)-frame LocalMap around the loop candidate in the map frame
-        int start = std::max(0, loopMatchID - loopClosureNeighborhood_);
-        int end   = std::min((int)keyLidarFrames_.size() - 1, loopMatchID + loopClosureNeighborhood_);
-
-        LocalMap loopLocalMap(end - start + 1);
-        for (int j = start; j <= end; ++j) {
-            loopLocalMap.pushKeyframe({keyLidarFrames_[j], pose3ToEigenIsometry(cloudKeyPoses6D_[j])});
+        LocalMap loopLocalMap(static_cast<int>(frameSnapshot.size()));
+        for (size_t j = 0; j < frameSnapshot.size(); ++j) {
+            loopLocalMap.pushKeyframe({frameSnapshot[j], pose3ToEigenIsometry(poseSnapshot[j])});
         }
 
-        // Initial guess = dead-reckoned absolute pose of current frame in map frame
-        Eigen::Isometry3f initialGuess = pose3ToEigenIsometry(currentPoseEstimate);
+        Eigen::Isometry3f initialGuess = pose3ToEigenIsometry(currentPose);
         scanMatching(loopLocalMap, currentLF, initialGuess);
 
-        // Recover BetweenFactor delta: pose_i^{-1} * refinedPose
         gtsam::Pose3 refinedPose = eigenIsometryToPose3(initialGuess);
-        loopPoseFactor = cloudKeyPoses6D_[loopMatchID].inverse().compose(refinedPose);
-
-        loopClosureCount_++;
-        RCLCPP_WARN(this->get_logger(), ">>> LOOP CLOSURE DETECTED! Frame %d -> Frame %d | Total loop closures: %d <<<", keyFrameID, loopMatchID, loopClosureCount_);
+        loopPoseFactor = poseSnapshot[relativeLoopMatchIdx].inverse().compose(refinedPose);
         return true;
     }
 
-    /**
-     * @todo: Maybe change later to the simpler residual radius check, select +/- n points around candidate and construct localMap for ICP/scanMatching
-     */
-    void attemptLoopClosure(LidarFrame& currentLF) {
-        PROFILE_BLOCK("attemptLoopClosure");
+    void loopClosureThreadFn() {
+        while (true) {
+            int currentKeyID;
+            {
+                std::unique_lock<std::mutex> lk(loop_input_mutex_);
+                loop_input_cv_.wait(lk, [this]{
+                    return !loop_input_queue_.empty() || loop_thread_stop_;
+                });
+                if (loop_thread_stop_) break;
+                currentKeyID = loop_input_queue_.front();
+                loop_input_queue_.pop();
+            }
 
-        if (keyFrameID < historySearchTimeDiff_) {
-            RCLCPP_INFO(this->get_logger(), "Not enough history to attempt loop closure. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
-            return;
+            if (!ENABLE_LOOP_CLOSURE) continue;
+
+            if (currentKeyID < historySearchTimeDiff_) continue;
+
+            // Brief lock: copy current keyframe and snapshot all poses
+            LidarFrame currentLF;
+            std::vector<gtsam::Pose3> poseSnap;
+            {
+                std::lock_guard<std::mutex> lk(map_mutex_);
+                currentLF = keyLidarFrames_[currentKeyID];
+                poseSnap  = cloudKeyPoses6D_;
+            }
+
+            int loopMatchID = findLoopMatchID(poseSnap, currentKeyID);
+            if (loopMatchID < 0) continue;
+
+            RCLCPP_INFO(get_logger(), "[LoopClosure] Candidate found. Current ID: %d, Match ID: %d",
+                currentKeyID, loopMatchID);
+
+            // Brief lock: snapshot the neighborhood frames and poses
+            int start = std::max(0, loopMatchID - loopClosureNeighborhood_);
+            int end   = std::min((int)keyLidarFrames_.size() - 1,
+                                 loopMatchID + loopClosureNeighborhood_);
+            std::vector<LidarFrame>   frameSnap;
+            std::vector<gtsam::Pose3> poseSnap2;
+            gtsam::Pose3 currentPose;
+            {
+                std::lock_guard<std::mutex> lk(map_mutex_);
+                frameSnap   = {keyLidarFrames_.begin() + start,
+                               keyLidarFrames_.begin() + end + 1};
+                poseSnap2   = {cloudKeyPoses6D_.begin() + start,
+                               cloudKeyPoses6D_.begin() + end + 1};
+                currentPose = cloudKeyPoses6D_[currentKeyID];
+            }
+
+            // Expensive scan matching — no lock held
+            gtsam::Pose3 factor;
+            if (!findLoopClosureFactor(currentLF, currentPose,
+                                       loopMatchID - start,
+                                       frameSnap, poseSnap2, factor)) {
+                RCLCPP_WARN(get_logger(), "[LoopClosure] Factor computation failed. Current ID: %d, Match ID: %d",
+                    currentKeyID, loopMatchID);
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(loop_output_mutex_);
+                loop_output_queue_.push({loopMatchID, currentKeyID, factor});
+            }
         }
-
-        int loopMatchID = findLoopMatchID();
-
-        // If no valid loop closures found, return
-        if (loopMatchID == -1) {
-            RCLCPP_INFO(this->get_logger(), "No valid loop closures found. Current ID: %d, History search time diff: %d", keyFrameID, historySearchTimeDiff_);
-            return;
-        }
-
-        RCLCPP_INFO(this->get_logger(), "Loop closure candidate found. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
-
-        gtsam::Pose3 loopPoseFactor = gtsam::Pose3::Identity();
-        bool isLoopClosureSuccessful = findLoopClosureFactor(currentLF, loopMatchID, loopPoseFactor);
-
-        if (!isLoopClosureSuccessful) {
-            RCLCPP_DEBUG(this->get_logger(), "Loop closure failed. Current ID: %d, Loop match ID: %d", keyFrameID, loopMatchID);
-            return;
-        }
-
-        // Add the loop closure factor to the graph
-        gtsam::Symbol currentKey('X', keyFrameID);
-        gtsam::Symbol historicalKey('X', loopMatchID);
-        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            historicalKey, currentKey, loopPoseFactor, loop_noise_));
     }
 
     void optimizeFactorGraph() {
