@@ -25,6 +25,7 @@ find_package(tf2_ros REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 
 add_executable(feature_extraction src/featureExtraction.cpp)
 ament_target_dependencies(feature_extraction rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
@@ -57,7 +58,7 @@ install(
 
 add_executable(global_map src/globalMap.cpp)
 ament_target_dependencies(global_map rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
-target_link_libraries(global_map ${PCL_LIBRARIES} gtsam)
+target_link_libraries(global_map ${PCL_LIBRARIES} gtsam Threads::Threads)
 
 add_executable(deskew src/deskew.cpp)
 ament_target_dependencies(deskew rclcpp sensor_msgs nav_msgs pcl_ros pcl_conversions)
