@@ -112,7 +112,6 @@ public:
     }
 
     void update(const pcl::PointCloud<pcl::PointXYZI>::Ptr& frame, const gtsam::Pose3& pose) {
-        // PROFILE_BLOCK("GlobalPointMap_update");
         Eigen::Isometry3f transform = pose3ToEigenIsometry(pose);
 
         // Loop directly over the incoming frame, no intermediate downsampling needed
@@ -335,7 +334,7 @@ public:
         * @todo: Multithreading
         */
     void extract3DFeatures() {
-        PROFILE_BLOCK("Extract 3D Features");
+        // PROFILE_BLOCK("Extract 3D Features");
         this->extractRings(_pcl);
 
         // create buckets per ring to containerize the memory accessed by each thread
@@ -410,7 +409,6 @@ public:
         * @todo: Currently building the mack from scratch every time keyframe is updated, can we do it incrementally instead?
         */
     void pushKeyframe(const std::pair<LidarFrame, Eigen::Isometry3f>& keyframe) {
-        // PROFILE_BLOCK("Update Local Map");
         _keyframes.push_back(keyframe);
         updateVoxelMaps();
     }
@@ -488,7 +486,7 @@ private:
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
     std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
 
-    PROFILE_BLOCK("scanMatching");
+    // PROFILE_BLOCK("scanMatching");
     if (map.getKeyframes().size() == 0) {return;}
 
     const int maxIterations = 25;
@@ -515,11 +513,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<float> dists;
             bool found;
             {
-                // PROFILE_BLOCK("KDTree_Edge_Search");
                 found = map.findEdgeNeighbors(edge, indices, dists);
             }
             if (found) {
-                // PROFILE_BLOCK("Edge_Jacobian_Calculation");
                 if (dists[1] > maxDistSq) continue;
 
                 Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
@@ -562,11 +558,9 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<float> dists;
             bool found;
             {
-                // PROFILE_BLOCK("KDTree_Plane_Search");
                 found = map.findPlaneNeighbors(patch, indices, dists);
             }
             if (found) {
-                // PROFILE_BLOCK("Plane_Jacobian_Calculation");
                 if (dists[2] > maxDistSq) continue;
 
                 Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
@@ -994,7 +988,6 @@ private:
     }
 
     void addAdjacentFactor(const gtsam::Pose3& odomStep) {
-        // PROFILE_BLOCK("Add_Adjacent_Factor");
         gtsam::Symbol currentKey('X', keyFrameID);
 
         // Add Prior factors (if first node) or BetweenFactors to gtSAMgraph_
@@ -1018,7 +1011,6 @@ private:
      * @todo: replace this with simple vectorized radius check using Eigen (euclidian dist within threshold, sort, return top match)
      */
     int findLoopMatchID(const std::vector<gtsam::Pose3>& poseSnapshot, int currentKeyID) {
-        PROFILE_BLOCK("findLoopMatchID");
         pcl::PointCloud<pcl::PointXYZ>::Ptr posCloud(new pcl::PointCloud<pcl::PointXYZ>());
         posCloud->reserve(poseSnapshot.size());
         for (const auto& pose : poseSnapshot) {
@@ -1100,7 +1092,6 @@ private:
         const std::vector<gtsam::Pose3>& poseSnapshot,
         gtsam::Pose3& loopPoseFactor)
     {
-        PROFILE_BLOCK("findLoopClosureFactor");
 
         LocalMap loopLocalMap(static_cast<int>(frameSnapshot.size()));
         for (size_t j = 0; j < frameSnapshot.size(); ++j) {
@@ -1132,9 +1123,16 @@ private:
                 loop_input_queue_.pop();
             }
 
-            if (!ENABLE_LOOP_CLOSURE) continue;
+            if (!ENABLE_LOOP_CLOSURE) {
+                RCLCPP_INFO(get_logger(), "[LoopClosure] KeyframeID %d: skipped — loop closure disabled", currentKeyID);
+                continue;
+            }
 
-            if (currentKeyID < historySearchTimeDiff_) continue;
+            if (currentKeyID < historySearchTimeDiff_) {
+                RCLCPP_INFO(get_logger(), "[LoopClosure] KeyframeID %d: skipped — not enough history (need %d frames)",
+                    currentKeyID, historySearchTimeDiff_);
+                continue;
+            }
 
             // Brief lock: copy current keyframe and snapshot all poses
             LidarFrame currentLF;
@@ -1146,9 +1144,13 @@ private:
             }
 
             int loopMatchID = findLoopMatchID(poseSnap, currentKeyID);
-            if (loopMatchID < 0) continue;
+            if (loopMatchID < 0) {
+                RCLCPP_INFO(get_logger(), "[LoopClosure] KeyframeID %d: no candidate found within %.1f m radius",
+                    currentKeyID, historySearchRadius_);
+                continue;
+            }
 
-            RCLCPP_INFO(get_logger(), "[LoopClosure] Candidate found. Current ID: %d, Match ID: %d",
+            RCLCPP_INFO(get_logger(), "[LoopClosure] KeyframeID %d: candidate at keyframe %d — running scan matching",
                 currentKeyID, loopMatchID);
 
             // Brief lock: snapshot the neighborhood frames and poses
@@ -1172,7 +1174,7 @@ private:
             if (!findLoopClosureFactor(currentLF, currentPose,
                                        loopMatchID - start,
                                        frameSnap, poseSnap2, factor)) {
-                RCLCPP_WARN(get_logger(), "[LoopClosure] Factor computation failed. Current ID: %d, Match ID: %d",
+                RCLCPP_WARN(get_logger(), "[LoopClosure] KeyframeID %d: rejected — fitness check failed against keyframe %d",
                     currentKeyID, loopMatchID);
                 continue;
             }
@@ -1181,11 +1183,13 @@ private:
                 std::lock_guard<std::mutex> lk(loop_output_mutex_);
                 loop_output_queue_.push({loopMatchID, currentKeyID, factor});
             }
+            RCLCPP_WARN(get_logger(), "[LoopClosure] KeyframeID %d: SUCCESS — factor queued between keyframe %d and keyframe %d",
+                currentKeyID, currentKeyID, loopMatchID);
         }
     }
 
     void optimizeFactorGraph() {
-        PROFILE_BLOCK("ISAM2_update_on_keyframe");
+        // PROFILE_BLOCK("ISAM2_update_on_keyframe");
 
         // Optimize the factor graph completely incrementally
         isam_->update(gtSAMgraph_, initialEstimate_);
@@ -1224,7 +1228,6 @@ private:
             return;
         }
 
-        // PROFILE_BLOCK("publishGlobalMap");
 
         std::vector<gtsam::Pose3> poses_copy;
         std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> frames_copy;
