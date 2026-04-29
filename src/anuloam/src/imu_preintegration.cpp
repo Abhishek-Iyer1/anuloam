@@ -219,7 +219,7 @@ class ImuPreintegration : public rclcpp::Node
 
       // optimize
       isam2_.update(graph_, values_);
-      // isam2_.update(); // TODO: liosam updates twice, do we need to?
+      isam2_.update(); // TODO: liosam updates twice, do we need to?
 
       // update prev state with optimization
       gtsam::Values result = isam2_.calculateEstimate();

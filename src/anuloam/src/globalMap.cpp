@@ -40,8 +40,6 @@
 
 #define NUM_RINGS 16
 
-// Toggle to enable or disable loop closures
-static constexpr bool ENABLE_LOOP_CLOSURE = true;
 
 struct PointXYZIR {
     PCL_ADD_POINT4D;
@@ -714,6 +712,9 @@ public:
 
         loop_closure_filter_.setLeafSize(0.4f, 0.4f, 0.4f);
 
+        declare_parameter("enable_loop_closure", false);
+        get_parameter("enable_loop_closure", enable_loop_closure_);
+
         loop_closure_thread_ = std::thread(&GlobalMapNode::loopClosureThreadFn, this);
     }
 
@@ -799,6 +800,7 @@ private:
     pcl::VoxelGrid<pcl::PointXYZI> loop_closure_filter_;
 
     // Loop Closure Parameters
+    bool enable_loop_closure_ = false;
     double historySearchRadius_ = 30.0; // Meters
     int historySearchTimeDiff_ = 30;    // Minimum frames between current and history
     double scanMatchFitnessThreshold_ = 0.3;  // Lower is better
@@ -1132,7 +1134,7 @@ private:
                 loop_input_queue_.pop();
             }
 
-            if (!ENABLE_LOOP_CLOSURE) continue;
+            if (!enable_loop_closure_) continue;
 
             if (currentKeyID < historySearchTimeDiff_) continue;
 

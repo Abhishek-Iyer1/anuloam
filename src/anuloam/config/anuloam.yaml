@@ -1,0 +1,23 @@
+imu_preintegration:
+  ros__parameters:
+    # IMU noise parameters (from IMU datasheet)
+    accel_noise_sigma: 9.0e-4      # accelerometer noise density (m/s^2/sqrt(Hz))
+    gyro_noise_sigma: 1.6e-4       # gyroscope noise density (rad/s/sqrt(Hz))
+    accel_bias_rw_sigma: 5.0e-4    # accelerometer bias random walk (m/s^2/sqrt(Hz))
+    gyro_bias_rw_sigma: 7.0e-5     # gyroscope bias random walk (rad/s/sqrt(Hz))
+
+feature_extraction:
+  ros__parameters:
+    neighbours: 16                 # number of neighboring points for roughness computation
+    edge_thresh: 0.25              # roughness threshold above which a point is an edge
+    planar_thresh: 1.0e-4          # roughness threshold below which a point is planar
+    total_features: 32             # total features extracted per ring
+    min_range: 1.0                 # minimum valid point range (m)
+    max_range: 20.0                # maximum valid point range (m)
+    iters: 25                      # max iterations for scan matching
+    epsilon: 1.0e-5                # convergence threshold on delta transform norm
+    max_dist_sq: 1.0               # max squared distance for nearest-neighbor correspondence (m^2)
+
+global_map:
+  ros__parameters:
+    enable_loop_closure: false     # set true to enable loop closure detection

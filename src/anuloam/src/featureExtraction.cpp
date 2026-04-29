@@ -42,6 +42,18 @@ struct PointRoughness {
     float roughness;
 };
 
+struct LidarFrameConfig {
+    int neighbours = 16;
+    float edgeThresh = 0.25f;
+    float planarThresh = 1e-4f;
+    int totalFeatures = 32;
+    float minRange = 1.0f;
+    float maxRange = 20.0f;
+    int iters = 50;
+    float epsilon = 1e-5f;
+    float maxDistSq = 1.0f;
+};
+
 
 /**
  * @todo: Need to support each point in the scan having a timestamp parameter
@@ -71,13 +83,13 @@ public:
     float computeRoughness(const pcl::PointCloud<PointXYZIR>& ring, size_t ind) {
 
         float norm = ring[ind].x * ring[ind].x + ring[ind].y * ring[ind].y + ring[ind].z * ring[ind].z;
-        if (norm < minRange * minRange || norm > maxRange * maxRange) {
+        if (norm < config_.minRange * config_.minRange || norm > config_.maxRange * config_.maxRange) {
             return -1.0f; // r < 0 filtered out later
         }
 
         size_t scanSize = ring.size();
-        int setStart = -(neighbours / 2);
-        int setEnd = (neighbours / 2);
+        int setStart = -(config_.neighbours / 2);
+        int setEnd = (config_.neighbours / 2);
 
         float sumX = 0, sumY = 0, sumZ = 0;
 
@@ -89,7 +101,7 @@ public:
             sumZ += ring[ind].z - ring[wrapped].z;
         }
 
-        return (sumX * sumX + sumY * sumY + sumZ * sumZ) / (neighbours * neighbours * norm);
+        return (sumX * sumX + sumY * sumY + sumZ * sumZ) / (config_.neighbours * config_.neighbours * norm);
     }
 
     /**
@@ -119,7 +131,7 @@ public:
             size_t startInd = static_cast<size_t>(static_cast<float>(section - 1) / numSections * scanSize);
             size_t endInd = static_cast<size_t>(static_cast<float>(section) / numSections * scanSize);
             size_t currentFeatures = 0;
-            size_t sectionFeatures = static_cast<size_t>(totalFeatures / numSections);
+            size_t sectionFeatures = static_cast<size_t>(config_.totalFeatures / numSections);
 
             // std::printf("Current Section: %lu, startInd: %lu, endInd: %lu, sectionFeatures: %lu", section/numSections, startInd, endInd, sectionFeatures);
 
@@ -143,7 +155,7 @@ public:
             );
 
             for (size_t i = 0; i < edgeFeaturesPerSection && i < roughnesses.size(); i++) {
-                if (roughnesses[i].roughness > edgeThresh) {
+                if (roughnesses[i].roughness > config_.edgeThresh) {
                     edgeFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
@@ -159,7 +171,7 @@ public:
             );
 
             for (size_t i = 0; i < planarFeaturesPerSection && i < roughnesses.size(); i++) {
-                if (roughnesses[i].roughness < planarThresh) {
+                if (roughnesses[i].roughness < config_.planarThresh) {
                     planarFeatures.push_back(ring[roughnesses[i].index]);
                 }
             }
@@ -208,6 +220,8 @@ public:
 
     // TODO: How to protect against getRings() called when rings is empty?
     // TODO: Don't need to store R in the point if I already have them in rings
+    void setConfig(const LidarFrameConfig& cfg) { config_ = cfg; }
+
     std::vector<pcl::PointCloud<PointXYZIR>> getRings() { return _rings; }
     pcl::PointCloud<PointXYZIR> getPCL() const {return _pcl;}
     pcl::PointCloud<PointXYZIR> getEdges() const {return _edges;}
@@ -220,12 +234,7 @@ private:
     pcl::PointCloud<PointXYZIR> _edges;
     pcl::PointCloud<PointXYZIR> _patches;
     pcl::PointCloud<PointXYZIR> _features;
-    int neighbours = 16;
-    float edgeThresh = 0.25;
-    float planarThresh = 1e-4; //1e-4;
-    int totalFeatures = 32;
-    float minRange = 1.0;
-    float maxRange = 20.0;
+    LidarFrameConfig config_;
 };
 
 /**
@@ -319,17 +328,14 @@ private:
  * @note: Both map and target must be in a common frame
  */
 void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& currentGuess,
+                  const LidarFrameConfig& config,
                   std::function<void(const pcl::PointCloud<PointXYZIR>&, int)> iterCallback = nullptr) {
 
     if (map.getKeyframes().size() == 0) {return;}
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    const int maxIterations = 50;
-    const float epsilon = 1e-5;
-    const float maxDistSq = 1.0;
-
-    for (int iter = 0; iter < maxIterations; ++iter) {
+    for (int iter = 0; iter < config.iters; ++iter) {
 
         // Go over the incoming LidarFrame
         Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
@@ -348,7 +354,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<int> indices;
             std::vector<float> dists;
             if (map.findEdgeNeighbors(edge, indices, dists)) {
-                if (dists[1] > maxDistSq) continue;
+                if (dists[1] > config.maxDistSq) continue;
 
                 Eigen::Vector3f pj = (map.getEdges())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pl = (map.getEdges())[indices[1]].getVector3fMap();
@@ -390,7 +396,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
             std::vector<float> dists;
 
             if (map.findPlaneNeighbors(patch, indices, dists)) {
-                if (dists[2] > maxDistSq) continue;
+                if (dists[2] > config.maxDistSq) continue;
 
                 Eigen::Vector3f pu = (map.getPatches())[indices[0]].getVector3fMap();
                 Eigen::Vector3f pv = (map.getPatches())[indices[1]].getVector3fMap();
@@ -456,7 +462,7 @@ void scanMatching(const LocalMap& map, LidarFrame& target, Eigen::Isometry3f& cu
         Eigen::Quaternionf q(currentGuess.linear());
         currentGuess.linear() = q.normalized().toRotationMatrix();
 
-        if (deltaTransform.norm() < epsilon) {
+        if (deltaTransform.norm() < config.epsilon) {
             std::printf("Converged at iteration %d!\n", iter);
             break;
         }
@@ -486,6 +492,24 @@ public:
     pubTest_ = create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
     pub_odom_inc_ = create_publisher<nav_msgs::msg::Odometry>("/odom_incremental", 10);
 
+    declare_parameter("neighbours", 16);
+    get_parameter("neighbours", frame_config_.neighbours);
+    declare_parameter("edge_thresh", 0.25);
+    get_parameter("edge_thresh", frame_config_.edgeThresh);
+    declare_parameter("planar_thresh", 1e-4);
+    get_parameter("planar_thresh", frame_config_.planarThresh);
+    declare_parameter("total_features", 32);
+    get_parameter("total_features", frame_config_.totalFeatures);
+    declare_parameter("min_range", 1.0);
+    get_parameter("min_range", frame_config_.minRange);
+    declare_parameter("max_range", 20.0);
+    get_parameter("max_range", frame_config_.maxRange);
+    declare_parameter("iters", 50);
+    get_parameter("iters", frame_config_.iters);
+    declare_parameter("epsilon", 1e-5);
+    get_parameter("epsilon", frame_config_.epsilon);
+    declare_parameter("max_dist_sq", 1.0);
+    get_parameter("max_dist_sq", frame_config_.maxDistSq);
   }
 
 private:
@@ -500,6 +524,7 @@ private:
     pcl::fromROSMsg(*msg, *cloud);
 
     LidarFrame LF = LidarFrame(*msg);
+    LF.setConfig(frame_config_);
     pcl::PointCloud<PointXYZIR> subCloud = LF.getPCL();
     LF.extractRings(subCloud);
 
@@ -544,12 +569,16 @@ private:
             imu_q_.pop_front();
         }
 
+        // Extract position from IMU message
+        const auto& p = imu_odo_meas.pose.pose.position;
+
         // Extract the orientation from the IMU message
         const auto& o = imu_odo_meas.pose.pose.orientation;
         Eigen::Quaternionf imu_quat(o.w, o.x, o.y, o.z);
 
         // Overwrite the rotation of the guess with the IMU rotation, keeping translation intact
         tf_guess.linear() = imu_quat.normalized().toRotationMatrix();
+        tf_guess.translation() = Eigen::Vector3f(p.x, p.y, p.z);
     }
 
     auto visualizeIter = [&](const pcl::PointCloud<PointXYZIR>& alignedCloud, int iter) {
@@ -560,7 +589,7 @@ private:
         pubTest_->publish(scanMsg);
     };
 
-    scanMatching(localMap, LF, tf_guess, visualizeIter);
+    scanMatching(localMap, LF, tf_guess, frame_config_, visualizeIter);
 
     current_lo_pose_ = tf_guess;
 
@@ -624,6 +653,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_inc_;
   LocalMap localMap;
+  LidarFrameConfig frame_config_;
 
   std::deque<nav_msgs::msg::Odometry> imu_q_;
 

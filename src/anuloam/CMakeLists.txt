@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.8)
 project(anuloam)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -45,7 +47,7 @@ target_link_libraries(imu_preintegration gtsam)
 # causing GLIBCXX version-not-found errors at runtime.
 foreach(target imu_preintegration feature_extraction)
   set_target_properties(${target} PROPERTIES
-    INSTALL_RPATH "/opt/ros/jazzy/lib"
+    INSTALL_RPATH "/opt/ros/humble/lib"
     INSTALL_RPATH_USE_LINK_PATH FALSE
     BUILD_WITH_INSTALL_RPATH TRUE
   )
@@ -82,6 +84,11 @@ install(
 install(
   DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
+)
+
+install(
+  DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 if(BUILD_TESTING)
