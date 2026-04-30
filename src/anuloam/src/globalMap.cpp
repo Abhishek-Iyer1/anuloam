@@ -30,6 +30,11 @@
 
 #include <Eigen/Geometry>
 
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
@@ -674,10 +679,14 @@ public:
             10
         );
         pubTest_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/points_test", 10);
-        pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
+        pubGlobalMap_         = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 10);
+        pubPath_              = this->create_publisher<nav_msgs::msg::Path>("/anuloam/path", 10);
+        pubGraph_             = this->create_publisher<visualization_msgs::msg::MarkerArray>("/anuloam/factor_graph", 10);
+        pubLoopHistoryCloud_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/anuloam/loop_history_cloud", 10);
+        pubLoopCurrentCloud_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/anuloam/loop_current_cloud", 10);
 
         // TF2 Broadcaster
-        // tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         // Create the 1Hz Timer for the Global Map
         map_timer_ = this->create_wall_timer(
@@ -744,7 +753,7 @@ private:
     std::thread                   loop_closure_thread_;
 
     // TF2 Broadcaster
-    // std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // Global Map State Tracking
     GlobalPointMap global_point_map_;
@@ -758,6 +767,13 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMapDebug_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubTest_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubGlobalMap_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubGraph_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLoopHistoryCloud_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLoopCurrentCloud_;
+
+    // Loop closure pair history for factor graph visualisation (main thread only)
+    std::vector<std::pair<int,int>> loopClosurePairs_;
 
     // LiDAR processing
     LocalMap localMap;
@@ -813,6 +829,7 @@ private:
         Eigen::Isometry3f currentTf = Eigen::Isometry3f::Identity();
         Eigen::Isometry3f delta = Eigen::Isometry3f::Identity();
         double cloudTime = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+        // Use IMU if available or pose of the last frame in local map
         calculateInitialTransformGuess(localMap, currentTf, cloudTime);
 
         // Perform scan matching
@@ -868,6 +885,7 @@ private:
                     gtsam::Symbol('X', lc.currentKeyID),
                     lc.factor, loop_noise_));
                 loopClosureCount_++;
+                loopClosurePairs_.emplace_back(lc.historicalKeyID, lc.currentKeyID);
                 RCLCPP_WARN(get_logger(), ">>> LOOP CLOSURE DETECTED! Frame %d -> Frame %d | Total: %d <<<",
                     lc.currentKeyID, lc.historicalKeyID, loopClosureCount_);
                 loop_output_queue_.pop();
@@ -877,6 +895,25 @@ private:
         optimizeFactorGraph();
 
         updateGlobalPoses();
+        publishPath(msg->header.stamp);
+        publishFactorGraph(msg->header.stamp);
+
+        // Broadcast map → velodyne TF from currentPoseEstimate
+        {
+            geometry_msgs::msg::TransformStamped t;
+            t.header.stamp    = msg->header.stamp;
+            t.header.frame_id = "map";
+            t.child_frame_id  = "velodyne";
+            t.transform.translation.x = currentPoseEstimate.translation().x();
+            t.transform.translation.y = currentPoseEstimate.translation().y();
+            t.transform.translation.z = currentPoseEstimate.translation().z();
+            gtsam::Quaternion q       = currentPoseEstimate.rotation().toQuaternion();
+            t.transform.rotation.w    = q.w();
+            t.transform.rotation.x    = q.x();
+            t.transform.rotation.y    = q.y();
+            t.transform.rotation.z    = q.z();
+            tf_broadcaster_->sendTransform(t);
+        }
 
         publishGlobalOdometry(currentTf, msg->header.stamp);
 
@@ -931,6 +968,17 @@ private:
         }
     }
 
+    /**
+     * @brief Refines the pose of the current LiDAR frame against the local map.
+     *
+     * @param currentGuess  In: initial guess of the current frame's pose in the map frame
+     *                      (typically from IMU or the last keyframe pose).
+     *                      Out: refined absolute pose of the current frame in the map frame
+     *                      after scan matching converges.
+     * @param delta         Out: relative transform from the most recent keyframe to the
+     *                      current frame, expressed in the keyframe's frame.
+     *                      Computed as: lastKeyframePose^{-1} * currentGuess.
+     */
     void performScanMatching(const LocalMap& localMap, LidarFrame& LF, Eigen::Isometry3f& currentGuess, Eigen::Isometry3f& delta, const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         // Handle first keyframe
         if(keyFrameID == 0) {
@@ -1090,7 +1138,8 @@ private:
         int relativeLoopMatchIdx,
         const std::vector<LidarFrame>& frameSnapshot,
         const std::vector<gtsam::Pose3>& poseSnapshot,
-        gtsam::Pose3& loopPoseFactor)
+        gtsam::Pose3& loopPoseFactor,
+        Eigen::Isometry3f* refinedIsometryOut = nullptr)
     {
 
         LocalMap loopLocalMap(static_cast<int>(frameSnapshot.size()));
@@ -1104,6 +1153,8 @@ private:
         if (!isMatchingSuccess(currentLF, initialGuess, loopLocalMap)) {
             return false;
         }
+
+        if (refinedIsometryOut) *refinedIsometryOut = initialGuess;
 
         gtsam::Pose3 refinedPose = eigenIsometryToPose3(initialGuess);
         loopPoseFactor = poseSnapshot[relativeLoopMatchIdx].inverse().compose(refinedPose);
@@ -1171,12 +1222,36 @@ private:
 
             // Expensive scan matching — no lock held
             gtsam::Pose3 factor;
+            Eigen::Isometry3f refinedIso;
             if (!findLoopClosureFactor(currentLF, currentPose,
                                        loopMatchID - start,
-                                       frameSnap, poseSnap2, factor)) {
+                                       frameSnap, poseSnap2, factor, &refinedIso)) {
                 RCLCPP_WARN(get_logger(), "[LoopClosure] KeyframeID %d: rejected — fitness check failed against keyframe %d",
                     currentKeyID, loopMatchID);
                 continue;
+            }
+
+            // Publish history submap and aligned current frame for Foxglove inspection
+            {
+                pcl::PointCloud<PointXYZIR> histCloud;
+                for (size_t j = 0; j < frameSnap.size(); ++j) {
+                    histCloud += frameSnap[j].transformEdges(pose3ToEigenIsometry(poseSnap2[j]));
+                    histCloud += frameSnap[j].transformPatches(pose3ToEigenIsometry(poseSnap2[j]));
+                }
+                sensor_msgs::msg::PointCloud2 histMsg;
+                pcl::toROSMsg(histCloud, histMsg);
+                histMsg.header.frame_id = "map";
+                histMsg.header.stamp    = now();
+                pubLoopHistoryCloud_->publish(histMsg);
+
+                pcl::PointCloud<PointXYZIR> curCloud;
+                curCloud += currentLF.transformEdges(refinedIso);
+                curCloud += currentLF.transformPatches(refinedIso);
+                sensor_msgs::msg::PointCloud2 curMsg;
+                pcl::toROSMsg(curCloud, curMsg);
+                curMsg.header.frame_id = "map";
+                curMsg.header.stamp    = now();
+                pubLoopCurrentCloud_->publish(curMsg);
             }
 
             {
@@ -1186,6 +1261,75 @@ private:
             RCLCPP_WARN(get_logger(), "[LoopClosure] KeyframeID %d: SUCCESS — factor queued between keyframe %d and keyframe %d",
                 currentKeyID, currentKeyID, loopMatchID);
         }
+    }
+
+    void publishPath(const rclcpp::Time& stamp) {
+        nav_msgs::msg::Path path;
+        path.header.stamp    = stamp;
+        path.header.frame_id = "map";
+        std::lock_guard<std::mutex> lk(map_mutex_);
+        for (const auto& pose : cloudKeyPoses6D_) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = path.header;
+            ps.pose.position.x = pose.translation().x();
+            ps.pose.position.y = pose.translation().y();
+            ps.pose.position.z = pose.translation().z();
+            gtsam::Quaternion q    = pose.rotation().toQuaternion();
+            ps.pose.orientation.w  = q.w();
+            ps.pose.orientation.x  = q.x();
+            ps.pose.orientation.y  = q.y();
+            ps.pose.orientation.z  = q.z();
+            path.poses.push_back(ps);
+        }
+        pubPath_->publish(path);
+    }
+
+    void publishFactorGraph(const rclcpp::Time& stamp) {
+        visualization_msgs::msg::MarkerArray ma;
+
+        auto makeMarker = [&](int id, int type, float r, float g, float b, float scale) {
+            visualization_msgs::msg::Marker m;
+            m.header.stamp    = stamp;
+            m.header.frame_id = "map";
+            m.ns     = "factor_graph";
+            m.id     = id;
+            m.type   = type;
+            m.action = visualization_msgs::msg::Marker::ADD;
+            m.scale.x = scale; m.scale.y = scale; m.scale.z = scale;
+            m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0f;
+            return m;
+        };
+
+        auto toPoint = [](const gtsam::Pose3& p) {
+            geometry_msgs::msg::Point pt;
+            pt.x = p.translation().x();
+            pt.y = p.translation().y();
+            pt.z = p.translation().z();
+            return pt;
+        };
+
+        std::vector<gtsam::Pose3> poses;
+        { std::lock_guard<std::mutex> lk(map_mutex_); poses = cloudKeyPoses6D_; }
+
+        auto nodes = makeMarker(0, visualization_msgs::msg::Marker::SPHERE_LIST, 0.0f, 1.0f, 0.0f, 0.3f);
+        for (const auto& p : poses) nodes.points.push_back(toPoint(p));
+
+        auto odomEdges = makeMarker(1, visualization_msgs::msg::Marker::LINE_LIST, 0.2f, 0.6f, 1.0f, 0.05f);
+        for (size_t i = 1; i < poses.size(); ++i) {
+            odomEdges.points.push_back(toPoint(poses[i-1]));
+            odomEdges.points.push_back(toPoint(poses[i]));
+        }
+
+        auto loopEdges = makeMarker(2, visualization_msgs::msg::Marker::LINE_LIST, 1.0f, 0.2f, 0.0f, 0.1f);
+        for (const auto& [histID, curID] : loopClosurePairs_) {
+            if (histID < (int)poses.size() && curID < (int)poses.size()) {
+                loopEdges.points.push_back(toPoint(poses[histID]));
+                loopEdges.points.push_back(toPoint(poses[curID]));
+            }
+        }
+
+        ma.markers = {nodes, odomEdges, loopEdges};
+        pubGraph_->publish(ma);
     }
 
     void optimizeFactorGraph() {

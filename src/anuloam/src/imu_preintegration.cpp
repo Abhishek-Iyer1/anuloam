@@ -153,14 +153,14 @@ class ImuPreintegration : public rclcpp::Node
       }
 
       // publish transform
-      geometry_msgs::msg::TransformStamped tf_msg;
-      tf_msg.header = odom_msg.header;
-      tf_msg.child_frame_id = odom_msg.child_frame_id;
-      tf_msg.transform.translation.x = odom_msg.pose.pose.position.x;
-      tf_msg.transform.translation.y = odom_msg.pose.pose.position.y;
-      tf_msg.transform.translation.z = odom_msg.pose.pose.position.z;
-      tf_msg.transform.rotation = odom_msg.pose.pose.orientation;
-      tf_broadcaster_->sendTransform(tf_msg);
+      // geometry_msgs::msg::TransformStamped tf_msg;
+      // tf_msg.header = odom_msg.header;
+      // tf_msg.child_frame_id = odom_msg.child_frame_id;
+      // tf_msg.transform.translation.x = odom_msg.pose.pose.position.x;
+      // tf_msg.transform.translation.y = odom_msg.pose.pose.position.y;
+      // tf_msg.transform.translation.z = odom_msg.pose.pose.position.z;
+      // tf_msg.transform.rotation = odom_msg.pose.pose.orientation;
+      // tf_broadcaster_->sendTransform(tf_msg);
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
